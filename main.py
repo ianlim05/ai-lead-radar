@@ -5,7 +5,7 @@ scores each news item 1-5, saves results.csv and prints the top leads.
 Does NOT touch LinkedIn. The LinkedIn column is just a search link for the salesperson.
 
 Setup:  pip install requests beautifulsoup4
-Run:    python gbs_lead_radar.py
+Run:    python main.py
 Optional AI scoring (free Gemini key from aistudio.google.com/apikey):
         set GEMINI_API_KEY=your_key      (Windows CMD)
         $env:GEMINI_API_KEY="your_key"   (PowerShell)
