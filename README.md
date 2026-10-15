@@ -1,4 +1,4 @@
-# GBS Lead Radar
+# AI Lead Radar
 
 An automated Python pipeline designed to accelerate B2B sales research for Global Business Services (GBS), Shared Services, and Center of Excellence (COE) setups. 
 
