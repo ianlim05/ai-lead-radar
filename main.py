@@ -52,8 +52,8 @@ KEYWORDS = [
 
 # Malaysian outlets, searched through Google News with a site: filter
 MALAYSIA_SITES = ["thestar.com.my", "theedgemalaysia.com", "nst.com.my", "malaymail.com", "bernama.com"]
-DAYS = 30  # 30 for testing, so there is enough news to judge. Use 7 for the weekly run.
-MIN_LEAD_SCORE = 3  # 3 for testing so borderline items show up. Use 4 for real leads.
+DAYS = 7
+MIN_LEAD_SCORE = 4  # 3 for testing so borderline items show up. Use 4 for real leads.
 MAX_AI_CALLS = 60
 COMPANY_ALIASES = {"tp": "Teleperformance"}  # same company under different names in the news (lowercase key)
 OUTREACH_MIN_SCORE = 4   # only leads at this score or higher get target roles and a draft message
@@ -477,8 +477,27 @@ def score_all(items):
         ai_calls += 1
         time.sleep(5)
 
-COLS = ["first_seen", "date", "score", "company", "signal", "location", "target_roles", "linkedin_message",
-        "outreach_status", "linkedin_url", "linkedin_description", "title", "source", "origin", "link", "linkedin_search"]
+COLS = [
+    # 1. Lead Triage
+    "score",
+    "company",
+    "location",
+    "signal",
+    # 2. Direct Outreach & Action
+    "linkedin_url",
+    "linkedin_search",
+    "target_roles",
+    "linkedin_message",
+    "outreach_status",
+    # 3. Source Evidence & Details
+    "title",
+    "link",
+    "linkedin_description",
+    "date",
+    "first_seen",
+    "source",
+    "origin"
+]
 
 def load_history():
     """Read the existing results file, so old leads and the salesperson's notes are kept."""
