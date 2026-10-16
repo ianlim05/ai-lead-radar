@@ -9,15 +9,12 @@ Run:    python main.py
 Optional AI scoring (free Gemini key from aistudio.google.com/apikey):
         set GEMINI_API_KEY=your_key      (Windows CMD)
         $env:GEMINI_API_KEY="your_key"   (PowerShell)
-Optional Scrapfly (free key from scrapfly.io):
-        set SCRAPFLY_API_KEY=your_key    (Windows CMD)
-        $env:SCRAPFLY_API_KEY="your_key" (PowerShell)
 """
 import csv
 import json
 import os
 from dotenv import load_dotenv
-load_dotenv()  # read GEMINI_API_KEY and SCRAPFLY_API_KEY from .env
+load_dotenv()  # read GEMINI_API_KEY from .env
 import re
 import time
 import urllib.parse
@@ -26,7 +23,12 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
-
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
+try:
+    from playwright_stealth import stealth_sync
+except ImportError:
+    stealth_sync = None
 import requests
 
 # ---------- SETTINGS (edit these) ----------
@@ -71,7 +73,6 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 # Tried in order. If one is overloaded (503) the next is used. Check current free model names in AI Studio.
 GEMINI_MODELS = ["gemini-3.8-flash", "gemini-flash-lite-latest"]
 
-SCRAPFLY_API_KEY = os.getenv("SCRAPFLY_API_KEY")
 # -------------------------------------------
 
 TOPIC = ["global business services", "shared services", "global capability cent",
@@ -198,90 +199,125 @@ def gemini_json(prompt):
     raise ConnectionError("Gemini is busy, over its free quota, or unreachable (" + last + ")")
 
 def fetch_linkedin_company_data(company_name):
-    """Uses Scrapfly to Google Search the real LinkedIn URL first, then scrapes it."""
-    if not SCRAPFLY_API_KEY or not company_name:
+    """
+    Uses local Playwright (Headless Chromium) with stealth evasion.
+    No login required; extracts data from public search and LinkedIn SEO metadata.
+    Includes full description and the exact verified URL.
+    """
+    if not company_name:
         return ""
-        
-    scrapfly_endpoint = "https://api.scrapfly.io/scrape"
-    
-    # ---------------------------------------------------------
-    # STEP 1: The Google X-Ray Search
-    # ---------------------------------------------------------
-    # We ask Google to find the official LinkedIn company page
-    google_search_query = f'site:linkedin.com/company "{company_name}"'
-    google_url = "https://www.google.com/search?q=" + urllib.parse.quote(google_search_query)
-    
-    search_params = {
-        "key": SCRAPFLY_API_KEY,
-        "url": google_url,
-        "asp": "true",       # Bypass Google's CAPTCHAs
-        "country": "my"
-    }
-    
-    verified_linkedin_url = ""
-    
-    try:
-        search_r = requests.get(scrapfly_endpoint, params=search_params, timeout=45)
-        if search_r.status_code == 200:
-            from bs4 import BeautifulSoup
-            search_soup = BeautifulSoup(search_r.text, "html.parser")
-            
-            # Find all links in the Google search results
-            for link in search_soup.find_all('a', href=True):
-                href = link['href']
-                # Grab the first actual LinkedIn company link Google provides
-                if "linkedin.com/company/" in href and not "google.com" in href:
-                    verified_linkedin_url = href
+
+    user_agent = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+
+    verified_url = ""
+    extracted_info = ""
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage"
+            ]
+        )
+        context = browser.new_context(
+            user_agent=user_agent,
+            viewport={"width": 1280, "height": 800},
+            locale="en-US"
+        )
+        page = context.new_page()
+        if stealth_sync:
+            stealth_sync(page)
+
+        # -------------------------------------------------------------
+        # STEP 1: Search DuckDuckGo (HTML) to find the verified company URL
+        # -------------------------------------------------------------
+        try:
+            query = f'site:linkedin.com/company "{company_name}"'
+            search_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
+            page.goto(search_url, timeout=25000, wait_until="domcontentloaded")
+
+            content = page.content()
+            soup = BeautifulSoup(content, "html.parser")
+
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                # DuckDuckGo wraps links in /l/?uddg=...
+                if "uddg=" in href:
+                    parsed = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+                    if "uddg" in parsed:
+                        actual_link = parsed["uddg"][0]
+                        if "linkedin.com/company/" in actual_link:
+                            verified_url = actual_link
+                            break
+                elif "linkedin.com/company/" in href:
+                    verified_url = href
                     break
-    except Exception as e:
-        print(f"      Google Search error: {e}")
+        except Exception as e:
+            print(f"      Search engine lookup warning: {e}")
+
+        # Fallback to normalized slug if search fails
+        if not verified_url:
+            clean_name = re.sub(r"[^a-zA-Z0-9-]", "-", company_name.lower().strip())
+            verified_url = f"https://www.linkedin.com/company/{clean_name}"
+
+        # -------------------------------------------------------------
+        # STEP 2: Visit the LinkedIn Page and Extract Full Public Metadata
+        # -------------------------------------------------------------
+        try:
+            # Set extra headers to mimic typical desktop web navigation
+            page.set_extra_http_headers({
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.google.com/"
+            })
+            response = page.goto(verified_url, timeout=30000, wait_until="domcontentloaded")
+
+            if response and response.status in (200, 999):  # 999 is custom LinkedIn anti-bot code
+                page_content = page.content()
+                soup = BeautifulSoup(page_content, "html.parser")
+
+                # 1. Try hidden structured JSON-LD (often has the full, un-truncated description)
+                for block in soup.find_all("script", type="application/ld+json"):
+                    try:
+                        import json
+                        data = json.loads(block.text)
+                        if data.get("@type") == "Organization" or "numberOfEmployees" in data:
+                            desc = data.get("description", "").strip()
+                            employees = data.get("numberOfEmployees", {}).get("value", "Unknown size")
+                            if desc:
+                                extracted_info = f"Size: {employees} | {desc}"
+                                break
+                    except Exception:
+                        continue
+
+                # 2. Try OpenGraph / Meta tag fallback (take full content without slicing)
+                if not extracted_info:
+                    meta_tag = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "description"})
+                    if meta_tag and meta_tag.get("content"):
+                        extracted_info = meta_tag["content"].strip()
+
+                if not extracted_info:
+                    extracted_info = "Profile loaded, but public bio was restricted."
+            else:
+                extracted_info = "Company page unavailable or blocked."
+
+        except Exception as e:
+            extracted_info = f"Playwright Error: {type(e).__name__}"
+        finally:
+            browser.close()
+
+    # Clean the text: replace newlines (\n) and carriage returns (\r) with a space
+    clean_info = " ".join(extracted_info.split())
+
+    if verified_url and "Error" not in clean_info and "unavailable" not in clean_info:
+        return verified_url, clean_info
         
-    # If Google couldn't find it, fall back to the old guessing method
-    if not verified_linkedin_url:
-        clean_name = re.sub(r'[^a-zA-Z0-9-]', '-', company_name.lower().strip())
-        verified_linkedin_url = f"https://www.linkedin.com/company/{clean_name}"
-        
-    # ---------------------------------------------------------
-    # STEP 2: Scrape the Verified LinkedIn Page
-    # ---------------------------------------------------------
-    scrape_params = {
-        "key": SCRAPFLY_API_KEY,
-        "url": verified_linkedin_url,
-        "asp": "true",
-        "render_js": "false",
-        "country": "my" 
-    }
-    
-    try:
-        r = requests.get(scrapfly_endpoint, params=scrape_params, timeout=45)
-        if r.status_code != 200:
-            return "Scrapfly blocked or page not found"
-            
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(r.text, "html.parser")
-        
-        # Method 1: Try the hidden JSON-LD blocks
-        json_blocks = soup.find_all("script", type="application/ld+json")
-        for block in json_blocks:
-            try:
-                data = json.loads(block.text)
-                if data.get("@type") == "Organization" or "numberOfEmployees" in data:
-                    desc = data.get("description", "No description")
-                    employees = data.get("numberOfEmployees", {}).get("value", "Unknown size")
-                    return f"Employees: {employees} | {desc[:150]}..."
-            except:
-                continue
-                
-        # Method 2: Fallback to SEO Meta Tags 
-        meta_desc = soup.find("meta", property="og:description")
-        if meta_desc and meta_desc.get("content"):
-            content = meta_desc["content"]
-            return f"Meta Data: {content[:150]}..."
-            
-        return "Profile found, but no data blocks or meta descriptions available."
-            
-    except Exception as e:
-        return f"Scrapfly Error: {type(e).__name__}"
+    return "", clean_info
 
 def draft_outreach(i):
     who = f" The sender works at {YOUR_COMPANY}." if YOUR_COMPANY else ""
@@ -442,7 +478,7 @@ def score_all(items):
         time.sleep(5)
 
 COLS = ["first_seen", "date", "score", "company", "signal", "location", "target_roles", "linkedin_message",
-        "outreach_status", "linkedin_company_info", "title", "source", "origin", "link", "linkedin_search"]
+        "outreach_status", "linkedin_url", "linkedin_description", "title", "source", "origin", "link", "linkedin_search"]
 
 def load_history():
     """Read the existing results file, so old leads and the salesperson's notes are kept."""
@@ -489,12 +525,15 @@ def main():
             "https://www.linkedin.com/search/results/companies/?keywords=" + urllib.parse.quote(i["company"])
             if i["company"] else "")
             
-        # Call Scrapfly for high-quality leads
+        # Call Playwright for high-quality leads
         if i.get("score", 1) >= OUTREACH_MIN_SCORE and i.get("company"):
             print(f"  Scraping LinkedIn info for {i['company']}...")
-            i["linkedin_company_info"] = fetch_linkedin_company_data(i["company"])
+            url, desc = fetch_linkedin_company_data(i["company"])
+            i["linkedin_url"] = url
+            i["linkedin_description"] = desc
         else:
-            i["linkedin_company_info"] = ""
+            i["linkedin_url"] = ""
+            i["linkedin_description"] = ""
             
     items.sort(key=lambda x: (-x["score"], x["date"]), reverse=False)
     add_outreach(items, skip={norm(r.get("company")) for r in history if r.get("linkedin_message")})
