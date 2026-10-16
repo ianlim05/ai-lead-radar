@@ -34,21 +34,7 @@ import requests
 # ---------- SETTINGS (edit these) ----------
 # Keywords come from this Excel file if it exists (sheet "Keywords": column A = Keyword, column B = Active Yes/No).
 KEYWORDS_FILE = "GBS Keywords.xlsx"
-OUTPUT_FILE = "results.csv"  # can also be a full path, e.g. a synced SharePoint folder
-
-# Built-in list, only used if the Excel file is missing or cannot be read:
-KEYWORDS = [
-    '"shared services centre" Malaysia',
-    '"global business services" Malaysia',
-    '"global capability centre" Malaysia',
-    '"global capability center" Malaysia',
-    '"set up" "shared services centre"',
-    '"establish" "global business services"',
-    '"regional hub" "shared services" Kuala Lumpur',
-    '"centre of excellence" "shared services"',
-    '"GBS" MDEC',
-    '"shared services" Penang',
-]
+OUTPUT_FILE = "results.csv"
 
 # Malaysian outlets, searched through Google News with a site: filter
 MALAYSIA_SITES = ["thestar.com.my", "theedgemalaysia.com", "nst.com.my", "malaymail.com", "bernama.com"]
@@ -75,10 +61,18 @@ GEMINI_MODELS = ["gemini-3.8-flash", "gemini-flash-lite-latest"]
 
 # -------------------------------------------
 
-TOPIC = ["global business services", "shared services", "global capability cent",
-         "centre of excellence", "center of excellence"]
-ACTION = ["set up", "setting up", "establish", "launch", "open", "new centre", "new center",
-          "expand", "expansion", "invest", "hub", "announce"]
+# Fallback defaults in case Excel sheets are missing
+DEFAULT_TOPIC = [
+    "global business services", "shared services", "global capability cent",
+    "centre of excellence", "center of excellence"
+]
+DEFAULT_ACTION = [
+    "set up", "setting up", "establish", "launch", "open", "new centre", 
+    "new center", "expand", "expansion", "invest", "hub", "announce"
+]
+
+TOPIC = list(DEFAULT_TOPIC)
+ACTION = list(DEFAULT_ACTION)
 
 def norm(s):
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())[:80]
@@ -368,33 +362,64 @@ def add_outreach(items, skip=()):
                 break
         time.sleep(5)
 
-def load_keywords():
+def load_excel_config():
+    """
+    Reads Keywords, Topics, and Actions directly from GBS Keywords.xlsx.
+    Non-technical users can customize everything without touching Python code.
+    """
+    global TOPIC, ACTION
+    
     if not os.path.exists(KEYWORDS_FILE):
-        print(f"Keyword file not found ({KEYWORDS_FILE}). Using the built-in keyword list.")
-        return KEYWORDS
+        print(f"Keyword file not found ({KEYWORDS_FILE}). Please create it.")
+        return []
+
     try:
         from openpyxl import load_workbook
         wb = load_workbook(KEYWORDS_FILE, read_only=True, data_only=True)
-        ws = wb["Keywords"] if "Keywords" in wb.sheetnames else wb.active
-        found = []
-        for row in ws.iter_rows(min_row=2, values_only=True):
+        
+        # 1. Load Search Keywords
+        keywords = []
+        ws_kw = wb["Keywords"] if "Keywords" in wb.sheetnames else wb.active
+        for row in ws_kw.iter_rows(min_row=2, values_only=True):
             kw = str(row[0]).strip() if row and row[0] else ""
             active = str(row[1]).strip().lower() if len(row) > 1 and row[1] is not None else "yes"
             if kw and active not in ("no", "n", "false", "0"):
-                found.append(kw)
+                keywords.append(kw)
+                
+        # 2. Load Topics (if sheet exists)
+        if "Topics" in wb.sheetnames:
+            custom_topics = [
+                str(row[0]).strip().lower() 
+                for row in wb["Topics"].iter_rows(min_row=2, values_only=True) 
+                if row and row[0]
+            ]
+            if custom_topics:
+                TOPIC = custom_topics
+
+        # 3. Load Actions (if sheet exists)
+        if "Actions" in wb.sheetnames:
+            custom_actions = [
+                str(row[0]).strip().lower() 
+                for row in wb["Actions"].iter_rows(min_row=2, values_only=True) 
+                if row and row[0]
+            ]
+            if custom_actions:
+                ACTION = custom_actions
+
         wb.close()
-        if not found:
-            print("No active keywords in the Excel file. Using the built-in keyword list.")
-            return KEYWORDS
-        print(f"Loaded {len(found)} active keywords from {KEYWORDS_FILE}")
-        return found
+        print(f"Loaded {len(keywords)} keywords, {len(TOPIC)} topics, and {len(ACTION)} actions from Excel.")
+        return keywords
+
+    except ImportError:
+        print("Error: Missing openpyxl. Please run 'pip install openpyxl' in your terminal.")
+        return []
     except Exception as e:
-        print("Could not read the keyword Excel file:", e, "\nUsing the built-in keyword list.")
-        return KEYWORDS
+        print(f"Could not read full Excel config: {e}.")
+        return []
 
 def collect():
     items = []
-    keywords = load_keywords()
+    keywords = load_excel_config()
     print("Collecting news...")
     for k in keywords:
         print(" ", k)
@@ -591,10 +616,10 @@ def main():
         more = f"  (+{i['extra']} more article(s))" if i["extra"] else ""
         print(f"[{i['score']}] {i['company'] or '(company not extracted)'} | {i['location']} | {i['date']}{more}")
         print(f"    {i['title']}\n    {i['link']}")
-        if i.get("linkedin_company_info"):
-            print(f"    LinkedIn Data: {i['linkedin_company_info']}")
-        elif i["linkedin_search"]:
-            print(f"    LinkedIn search: {i['linkedin_search']}")
+        if i.get("linkedin_url"):
+            print(f"    LinkedIn: {i['linkedin_url']}")
+        elif i.get("linkedin_search"):
+            print(f"    LinkedIn Search: {i['linkedin_search']}")
         if i.get("linkedin_message"):
             print(f"    Roles to contact: {i['target_roles']}\n    Draft message: {i['linkedin_message']}")
         print()
