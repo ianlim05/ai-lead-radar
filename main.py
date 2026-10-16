@@ -198,36 +198,73 @@ def gemini_json(prompt):
     raise ConnectionError("Gemini is busy, over its free quota, or unreachable (" + last + ")")
 
 def fetch_linkedin_company_data(company_name):
-    """Uses Scrapfly to bypass LinkedIn anti-bot walls and extract public company info."""
+    """Uses Scrapfly to Google Search the real LinkedIn URL first, then scrapes it."""
     if not SCRAPFLY_API_KEY or not company_name:
         return ""
-    
-    clean_name = re.sub(r'[^a-zA-Z0-9-]', '-', company_name.lower().strip())
-    linkedin_url = f"https://www.linkedin.com/company/{clean_name}"
-    
+        
     scrapfly_endpoint = "https://api.scrapfly.io/scrape"
-    params = {
+    
+    # ---------------------------------------------------------
+    # STEP 1: The Google X-Ray Search
+    # ---------------------------------------------------------
+    # We ask Google to find the official LinkedIn company page
+    google_search_query = f'site:linkedin.com/company "{company_name}"'
+    google_url = "https://www.google.com/search?q=" + urllib.parse.quote(google_search_query)
+    
+    search_params = {
         "key": SCRAPFLY_API_KEY,
-        "url": linkedin_url,
+        "url": google_url,
+        "asp": "true",       # Bypass Google's CAPTCHAs
+        "country": "my"
+    }
+    
+    verified_linkedin_url = ""
+    
+    try:
+        search_r = requests.get(scrapfly_endpoint, params=search_params, timeout=45)
+        if search_r.status_code == 200:
+            from bs4 import BeautifulSoup
+            search_soup = BeautifulSoup(search_r.text, "html.parser")
+            
+            # Find all links in the Google search results
+            for link in search_soup.find_all('a', href=True):
+                href = link['href']
+                # Grab the first actual LinkedIn company link Google provides
+                if "linkedin.com/company/" in href and not "google.com" in href:
+                    verified_linkedin_url = href
+                    break
+    except Exception as e:
+        print(f"      Google Search error: {e}")
+        
+    # If Google couldn't find it, fall back to the old guessing method
+    if not verified_linkedin_url:
+        clean_name = re.sub(r'[^a-zA-Z0-9-]', '-', company_name.lower().strip())
+        verified_linkedin_url = f"https://www.linkedin.com/company/{clean_name}"
+        
+    # ---------------------------------------------------------
+    # STEP 2: Scrape the Verified LinkedIn Page
+    # ---------------------------------------------------------
+    scrape_params = {
+        "key": SCRAPFLY_API_KEY,
+        "url": verified_linkedin_url,
         "asp": "true",
         "render_js": "false",
         "country": "my" 
     }
     
     try:
-        r = requests.get(scrapfly_endpoint, params=params, timeout=45)
+        r = requests.get(scrapfly_endpoint, params=scrape_params, timeout=45)
         if r.status_code != 200:
             return "Scrapfly blocked or page not found"
             
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(r.text, "html.parser")
         
-        # Method 1: Try the hidden JSON-LD blocks (LinkedIn sometimes has multiple)
+        # Method 1: Try the hidden JSON-LD blocks
         json_blocks = soup.find_all("script", type="application/ld+json")
         for block in json_blocks:
             try:
                 data = json.loads(block.text)
-                # Check if this specific block is the organization block
                 if data.get("@type") == "Organization" or "numberOfEmployees" in data:
                     desc = data.get("description", "No description")
                     employees = data.get("numberOfEmployees", {}).get("value", "Unknown size")
@@ -235,12 +272,10 @@ def fetch_linkedin_company_data(company_name):
             except:
                 continue
                 
-        # Method 2: Fallback to SEO Meta Tags (Highly reliable)
-        # LinkedIn puts a summary in the 'og:description' tag for link previews
+        # Method 2: Fallback to SEO Meta Tags 
         meta_desc = soup.find("meta", property="og:description")
         if meta_desc and meta_desc.get("content"):
             content = meta_desc["content"]
-            # The content usually looks like: "Company Name | 50,000 followers on LinkedIn. [Description]"
             return f"Meta Data: {content[:150]}..."
             
         return "Profile found, but no data blocks or meta descriptions available."
