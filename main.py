@@ -1,10 +1,10 @@
 """
-GBS Lead Radar - test version
-Searches Google News + Bing News (Malaysia focus) and optional extra RSS feeds for companies planning a GBS / shared services / COE,
-scores each news item 1-5, saves results.csv and prints the top leads.
-Does NOT touch LinkedIn. The LinkedIn column is just a search link for the salesperson.
+GBS Lead Radar
+Searches Google News + Bing News (Malaysia focus) and extra RSS feeds for companies planning a GBS / shared services / COE.
+Scores leads 1-5, uses Playwright to extract public LinkedIn company metadata securely, and saves to results.csv.
 
-Setup:  pip install requests beautifulsoup4
+Setup:  pip install requests beautifulsoup4 openpyxl playwright playwright-stealth
+        playwright install chromium
 Run:    python main.py
 Optional AI scoring (free Gemini key from aistudio.google.com/apikey):
         set GEMINI_API_KEY=your_key      (Windows CMD)
@@ -14,10 +14,10 @@ import csv
 import json
 import os
 from dotenv import load_dotenv
+import urllib
 load_dotenv()  # read GEMINI_API_KEY from .env
 import re
 import time
-import urllib.parse
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
@@ -39,7 +39,7 @@ OUTPUT_FILE = "results.csv"
 # Malaysian outlets, searched through Google News with a site: filter
 MALAYSIA_SITES = ["thestar.com.my", "theedgemalaysia.com", "nst.com.my", "malaymail.com", "bernama.com"]
 DAYS = 7
-MIN_LEAD_SCORE = 4  # 3 for testing so borderline items show up. Use 4 for real leads.
+MIN_LEAD_SCORE = 4  # Only output high-quality leads (4 or 5) to the terminal
 MAX_AI_CALLS = 60
 COMPANY_ALIASES = {"tp": "Teleperformance"}  # same company under different names in the news (lowercase key)
 OUTREACH_MIN_SCORE = 4   # only leads at this score or higher get target roles and a draft message
@@ -199,7 +199,7 @@ def fetch_linkedin_company_data(company_name):
     Includes full description and the exact verified URL.
     """
     if not company_name:
-        return ""
+        return "", ""
 
     user_agent = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -278,7 +278,6 @@ def fetch_linkedin_company_data(company_name):
                 # 1. Try hidden structured JSON-LD (often has the full, un-truncated description)
                 for block in soup.find_all("script", type="application/ld+json"):
                     try:
-                        import json
                         data = json.loads(block.text)
                         if data.get("@type") == "Organization" or "numberOfEmployees" in data:
                             desc = data.get("description", "").strip()
