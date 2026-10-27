@@ -3,7 +3,7 @@ GBS Lead Radar
 Searches Google News + Bing News (Malaysia focus) and extra RSS feeds for companies planning a GBS / shared services / COE.
 Scores leads 1-5, uses Playwright to extract public LinkedIn company metadata securely, and saves to results.csv.
 
-Setup:  pip install requests beautifulsoup4 openpyxl playwright playwright-stealth
+Setup:  pip install requests openpyxl playwright
         playwright install chromium
 Run:    python main.py
 Optional AI scoring (free Gemini key from aistudio.google.com/apikey):
@@ -11,6 +11,7 @@ Optional AI scoring (free Gemini key from aistudio.google.com/apikey):
         $env:GEMINI_API_KEY="your_key"   (PowerShell)
 """
 import csv
+print("Script is starting...")
 import json
 import os
 from dotenv import load_dotenv
@@ -23,13 +24,9 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
-try:
-    from playwright_stealth import stealth_sync
-except ImportError:
-    stealth_sync = None
 import requests
+from agent_reach.channels.web import WebChannel
+from agent_reach.runtime.dispatch import run_action
 
 # ---------- SETTINGS (edit these) ----------
 # Keywords come from this Excel file if it exists (sheet "Keywords": column A = Keyword, column B = Active Yes/No).
@@ -38,7 +35,7 @@ OUTPUT_FILE = "results.csv"
 
 # Malaysian outlets, searched through Google News with a site: filter
 MALAYSIA_SITES = ["thestar.com.my", "theedgemalaysia.com", "nst.com.my", "malaymail.com", "bernama.com"]
-DAYS = 7
+DAYS = 30
 MIN_LEAD_SCORE = 4  # Only output high-quality leads (4 or 5) to the terminal
 MAX_AI_CALLS = 60
 COMPANY_ALIASES = {"tp": "Teleperformance"}  # same company under different names in the news (lowercase key)
@@ -61,18 +58,9 @@ GEMINI_MODELS = ["gemini-3.8-flash", "gemini-flash-lite-latest"]
 
 # -------------------------------------------
 
-# Fallback defaults in case Excel sheets are missing
-DEFAULT_TOPIC = [
-    "global business services", "shared services", "global capability cent",
-    "centre of excellence", "center of excellence"
-]
-DEFAULT_ACTION = [
-    "set up", "setting up", "establish", "launch", "open", "new centre", 
-    "new center", "expand", "expansion", "invest", "hub", "announce"
-]
-
-TOPIC = list(DEFAULT_TOPIC)
-ACTION = list(DEFAULT_ACTION)
+# Variables populated by the Excel file
+TOPIC = []
+ACTION = []
 
 def norm(s):
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())[:80]
@@ -148,13 +136,15 @@ def rule_score(title):
 
 def ai_score(title):
     prompt = (
-        'From this news headline, return ONE JSON object (not a list), no other text: {"company": string or "", '
+        'From this news headline, return ONE JSON object (not a list), no other text: {"company": the organisation that will own the centre (if a vendor builds it for a client, give only the client\'s name), '
         '"signal": short phrase on whether the company is planning/setting up a GBS, shared services '
         'centre, global capability centre or COE, "location": string, "score": integer 1-5 for how '
         'strong a sales lead this is. Scoring rules: 5 = a named company clearly announces setting up or expanding its OWN GBS, '
         'shared services centre, global capability centre or COE; 3-4 = likely plans, or hiring or a site expansion for such a '
         'centre; 2 = a vendor or outsourcing deal, or a relevant company only mentioned in passing; 1 = executive '
-        'appointments, reports, surveys, commentary, government news or anything unrelated}. '
+        'appointments, reports, surveys, commentary, government news or anything unrelated. '
+        'A "Centre of Excellence" counts only if it is an internal shared-services or operations centre; '
+        "a technology vendor's own AI or innovation lab for customers scores 2.}. "
         "Headline: " + title
     )
     return gemini_json(prompt)
@@ -192,144 +182,119 @@ def gemini_json(prompt):
             return data
     raise ConnectionError("Gemini is busy, over its free quota, or unreachable (" + last + ")")
 
-def fetch_linkedin_company_data(company_name):
-    """
-    Uses local Playwright (Headless Chromium) with stealth evasion.
-    No login required; extracts data from public search and LinkedIn SEO metadata.
-    Includes full description and the exact verified URL.
-    """
-    if not company_name:
-        return "", ""
+def fetch_article_text(url):
+    text = ""
+    print(f"    reading: {url}")
+    try:
+        out = run_action(WebChannel(), "read", {"target": url}, timeout=25.0)
+        if out.get("ok") and out.get("items"):
+            text = str(out["items"][0].get("text", ""))
+        else:
+            print(f"    Agent-Reach could not read it: {str(out)[:200]}")
+    except Exception as e:
+        print(f"    Agent-Reach error: {e}")
+    if len(text) < 500:  # fall back to Jina Reader directly
+        try:
+            r = requests.get("https://r.jina.ai/" + url, headers={"Accept": "text/plain"}, timeout=40)
+            print(f"    Jina fallback: HTTP {r.status_code}, {len(r.text)} chars")
+            if r.status_code == 200:
+                text = r.text
+        except Exception as e:
+            print(f"    Jina fallback error: {e}")
+    return text[:8000]
 
-    user_agent = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-
-    verified_url = ""
-    extracted_info = ""
-
+def fetch_article_text_playwright(url):
+    """Open a page in a normal headless browser. Follows Google News redirects. Returns (final_url, text)."""
+    from playwright.sync_api import sync_playwright
+    final_url, text = url, ""
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage"
-            ]
-        )
-        context = browser.new_context(
-            user_agent=user_agent,
-            viewport={"width": 1280, "height": 800},
-            locale="en-US"
-        )
-        page = context.new_page()
-        if stealth_sync:
-            stealth_sync(page)
-
-        # -------------------------------------------------------------
-        # STEP 1: Search DuckDuckGo (HTML) to find the verified company URL
-        # -------------------------------------------------------------
+        browser = p.chromium.launch(headless=True)
         try:
-            query = f'site:linkedin.com/company "{company_name}"'
-            search_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
-            page.goto(search_url, timeout=25000, wait_until="domcontentloaded")
-
-            content = page.content()
-            soup = BeautifulSoup(content, "html.parser")
-
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                # DuckDuckGo wraps links in /l/?uddg=...
-                if "uddg=" in href:
-                    parsed = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
-                    if "uddg" in parsed:
-                        actual_link = parsed["uddg"][0]
-                        if "linkedin.com/company/" in actual_link:
-                            verified_url = actual_link
-                            break
-                elif "linkedin.com/company/" in href:
-                    verified_url = href
-                    break
-        except Exception as e:
-            print(f"      Search engine lookup warning: {e}")
-
-        # Fallback to normalized slug if search fails
-        if not verified_url:
-            clean_name = re.sub(r"[^a-zA-Z0-9-]", "-", company_name.lower().strip())
-            verified_url = f"https://www.linkedin.com/company/{clean_name}"
-
-        # -------------------------------------------------------------
-        # STEP 2: Visit the LinkedIn Page and Extract Full Public Metadata
-        # -------------------------------------------------------------
-        try:
-            # Set extra headers to mimic typical desktop web navigation
-            page.set_extra_http_headers({
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://www.google.com/"
-            })
-            response = page.goto(verified_url, timeout=30000, wait_until="domcontentloaded")
-
-            if response and response.status in (200, 999):  # 999 is custom LinkedIn anti-bot code
-                page_content = page.content()
-                soup = BeautifulSoup(page_content, "html.parser")
-
-                # 1. Try hidden structured JSON-LD (often has the full, un-truncated description)
-                for block in soup.find_all("script", type="application/ld+json"):
-                    try:
-                        data = json.loads(block.text)
-                        if data.get("@type") == "Organization" or "numberOfEmployees" in data:
-                            desc = data.get("description", "").strip()
-                            employees = data.get("numberOfEmployees", {}).get("value", "Unknown size")
-                            if desc:
-                                extracted_info = f"Size: {employees} | {desc}"
-                                break
-                    except Exception:
-                        continue
-
-                # 2. Try OpenGraph / Meta tag fallback (take full content without slicing)
-                if not extracted_info:
-                    meta_tag = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "description"})
-                    if meta_tag and meta_tag.get("content"):
-                        extracted_info = meta_tag["content"].strip()
-
-                if not extracted_info:
-                    extracted_info = "Profile loaded, but public bio was restricted."
-            else:
-                extracted_info = "Company page unavailable or blocked."
-
-        except Exception as e:
-            extracted_info = f"Playwright Error: {type(e).__name__}"
+            page = browser.new_page()
+            page.goto(url, timeout=30000, wait_until="domcontentloaded")
+            try:  # a Google News link redirects to the publisher; wait until we leave news.google.com
+                page.wait_for_url(lambda u: "news.google.com" not in u, timeout=10000)
+            except Exception:
+                pass
+            page.wait_for_timeout(1500)
+            final_url = page.url
+            el = page.query_selector("article") or page.query_selector("main") or page.query_selector("body")
+            text = " ".join((el.inner_text() if el else "").split())
         finally:
             browser.close()
+    return final_url, text
 
-    # Clean the text: replace newlines (\n) and carriage returns (\r) with a space
-    clean_info = " ".join(extracted_info.split())
 
-    if verified_url and "Error" not in clean_info and "unavailable" not in clean_info:
-        return verified_url, clean_info
-        
-    return "", clean_info
-
-def draft_outreach(i):
-    who = f" The sender works at {YOUR_COMPANY}." if YOUR_COMPANY else ""
+def generate_executive_brief(i, article_text):
+    note = ""
+    if len(article_text) < 500:
+        note = "\nArticle text is NOT available. Use only the headline, write Not stated for scale, and use an empty list for key_players."
     prompt = (
-        'Return ONE JSON object (not a list), no other text, with two keys. '
-        '"target_roles": a comma-separated string of exactly 3 job titles that would most likely lead or influence a GBS, '
-        'shared services centre, global capability centre or COE at this company (for example Head of Global Business '
-        'Services, Finance Director, HR Director). '
-        '"message": a friendly, natural LinkedIn connection message of at most 280 characters from a salesperson. It should '
-        'mention the news below, say they would like to connect and learn about the plans, and sound human. Use only facts '
-        'from the news. Do not mention prices, do not claim anything about the recipient, do not use emojis, and start '
-        'with "Hi [Name],".' + who + " "
-        f"Company: {i['company']}. Signal: {i['signal']}. Location: {i['location']}. Headline: {i['title']}"
+        'Analyze the provided news article and return ONE JSON object with EXACTLY these four keys: '
+        '"trigger_event" (1-sentence summary of the launch/expansion), '
+        '"scale" (exact numbers for headcount/investment. If none, write "Not stated"), '
+        '"key_players" (a list of objects like {"name": "...", "title": "..."} for each executive named or quoted in the article, or an empty list), '
+        '"angle" (1 sentence that must cite a specific fact from the article, such as headcount, function or location; if there is none, write "Not enough detail").\n'
+        'CRITICAL RULE: Do not invent names or numbers. If a number is not in the text, write "Not stated". '
+        'If no executive is named, use an empty list.\n\n'
+        f"Company: {i.get('company', '')}\nHeadline: {i.get('title', '')}\nArticle: {article_text}"
+        f"{note}\n"
     )
-    j = gemini_json(prompt)
-    roles = j.get("target_roles", "")
-    if isinstance(roles, list):
-        roles = ", ".join(str(r) for r in roles)
-    return str(roles).strip(), str(j.get("message", "")).strip()
+    return gemini_json(prompt)
+
+def find_publisher_link(title, company=""):
+    """Google News links cannot be read. Find the same story on Bing to get the real article address."""
+    clean = re.sub(r"\s+-\s+[^-]+$", "", title)
+    kw = [w for w in re.findall(r"[a-z0-9]+", clean.lower()) if len(w) > 3]
+    words = set(kw)
+    for query in (f'"{clean}"', clean, f"{company} {' '.join(kw[:6])}".strip()):
+        try:
+            r = requests.get("https://www.bing.com/news/search", params={"q": query, "format": "rss"},
+                             headers=HEADERS, timeout=30)
+            best, best_score = "", 0
+            for it in parse_rss(r.content, "BingNews", days=30):
+                if "news.google.com" in it["link"]:
+                    continue
+                t_words = {w for w in re.findall(r"[a-z0-9]+", it["title"].lower()) if len(w) > 3}
+                overlap = len(words & t_words) / max(1, len(words))
+                if overlap > best_score:
+                    best, best_score = it["link"], overlap
+            if best_score >= 0.5:
+                print(f"    publisher link found ({best_score:.0%} match): {best}")
+                return best
+        except Exception as e:
+            print(f"    Bing lookup error: {e}")
+    print("    no publisher link found on Bing")
+    return ""
+
+def apply_players(i, j, article_text):
+    """Keep only executives that really appear in the article text."""
+    players = j.get("key_players", [])
+    if not isinstance(players, list):
+        players = []
+    players = [p for p in players if isinstance(p, dict) and str(p.get("name", "")).strip()]
+    players = [p for p in players if p["name"].strip().lower() in article_text.lower()]
+    i["key_players"] = "; ".join(f'{p["name"].strip()} ({str(p.get("title", "")).strip()})' for p in players) or "Not stated"
+    i["first_contact_name"] = players[0]["name"].strip() if players else ""
+
+def build_linkedin_link(i):
+    company = i.get("company", "")
+    name = i.get("first_contact_name", "")
+    
+    company_search = ""
+    people_search = ""
+    
+    if company:
+        # 1. LinkedIn Company Keyword Search (100% reliable)
+        company_search = f"https://www.linkedin.com/search/results/companies/?keywords={urllib.parse.quote(company)}"
+        
+        # 2. LinkedIn People Search (Finds the executives)
+        if name:
+            people_search = f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(f'{name} {company}')}"
+        else:
+            people_search = f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(company)}"
+            
+    return company_search, people_search
 
 def add_outreach(items, skip=()):
     """Items must already be sorted best score first. One draft per company."""
@@ -343,11 +308,52 @@ def add_outreach(items, skip=()):
             seen.add(key)
             todo.append(i)
     todo = todo[:MAX_OUTREACH_CALLS]
-    print(f"\nDrafting target roles and LinkedIn messages for {len(todo)} companies...")
+    print(f"\nResearching {len(todo)} companies (reading articles and building cheat sheets)...")
     fails = 0
     for i in todo:
         try:
-            i["target_roles"], i["linkedin_message"] = draft_outreach(i)
+            print(f"  Deep researching {i['company']}...")
+            
+            # 1. Use the new Bing lookup to resolve Google News redirects to real publisher URLs
+            url = find_publisher_link(i["title"], i.get("company", "")) if "news.google.com" in i["link"] else i["link"]
+            
+            # 2. Try the primary Agent-Reach stealth reader
+            article_text = fetch_article_text(url or i["link"])
+            
+            # 3. If it failed to get sufficient text, fallback to the standard Playwright browser reader
+            if len(article_text) < 500:
+                try:
+                    final_url, article_text = fetch_article_text_playwright(url or i["link"])
+                    print(f"    browser reader: {len(article_text)} chars from {final_url[:80]}")
+                except Exception as e:
+                    print(f"    browser reader error: {type(e).__name__}")
+                    article_text = ""
+            
+            article_text = article_text[:8000]
+            
+            i["article_status"] = f"full text ({len(article_text)} chars)" if len(article_text) > 500 else "headline only"
+            print(f"    article: {i['article_status']}")
+            
+            # Get the JSON dictionary from Gemini
+            j_raw = generate_executive_brief(i, article_text)
+            print("    [DEBUG] AI Output:", j_raw)  
+            
+            # Safely extract the strings
+            i["trigger_event"] = str(j_raw.get("trigger_event", ""))
+            i["scale"] = str(j_raw.get("scale", ""))
+            
+            # MUST call this to verify the names and set i["first_contact_name"] for the LinkedIn link
+            apply_players(i, j_raw, article_text)
+            
+            if i["article_status"] == "headline only":
+                i["angle"] = "Not enough detail (article could not be read)"
+            else:
+                i["angle"] = str(j_raw.get("angle", ""))
+                
+            # Generate the two new separated LinkedIn links
+            comp_search, people_link = build_linkedin_link(i)
+            i["linkedin_company_search"] = comp_search
+            i["linkedin_people_search"] = people_link
             i["outreach_status"] = "New"
             fails = 0
         except PermissionError as e:
@@ -501,27 +507,9 @@ def score_all(items):
         ai_calls += 1
         time.sleep(5)
 
-COLS = [
-    # 1. Lead Triage
-    "score",
-    "company",
-    "location",
-    "signal",
-    # 2. Direct Outreach & Action
-    "linkedin_url",
-    "linkedin_search",
-    "target_roles",
-    "linkedin_message",
-    "outreach_status",
-    # 3. Source Evidence & Details
-    "title",
-    "link",
-    "linkedin_description",
-    "date",
-    "first_seen",
-    "source",
-    "origin"
-]
+COLS = ["score", "company", "location", "signal", "trigger_event", "scale", "key_players", "angle",
+        "article_status", "outreach_status", "linkedin_company_search", "linkedin_people_search",
+        "title", "link", "date", "first_seen", "source", "origin"]
 
 def load_history():
     """Read the existing results file, so old leads and the salesperson's notes are kept."""
@@ -554,47 +542,35 @@ def main():
     items = [i for i in found if i["link"] not in known_links and norm(i["title"]) not in known_titles]
     print(f"\n{len(found)} unique articles found, {len(items)} are new since the last run "
           f"({len(history)} older rows kept).")
+    
     if not items:
         print("Nothing new to add. The results file was not changed.")
         return
+        
     today = f"{datetime.now():%Y-%m-%d}"
     for i in items:
         i["first_seen"] = today
     
     score_all(items)
     
-    for i in items:
-        i["linkedin_search"] = (
-            "https://www.linkedin.com/search/results/companies/?keywords=" + urllib.parse.quote(i["company"])
-            if i["company"] else "")
-            
-        # Call Playwright for high-quality leads
-        if i.get("score", 1) >= OUTREACH_MIN_SCORE and i.get("company"):
-            print(f"  Scraping LinkedIn info for {i['company']}...")
-            url, desc = fetch_linkedin_company_data(i["company"])
-            i["linkedin_url"] = url
-            i["linkedin_description"] = desc
-        else:
-            i["linkedin_url"] = ""
-            i["linkedin_description"] = ""
-            
-    items.sort(key=lambda x: (-x["score"], x["date"]), reverse=False)
-    add_outreach(items, skip={norm(r.get("company")) for r in history if r.get("linkedin_message")})
+    # 2. Call the updated outreach function (Skip check now looks for 'trigger_event' instead of 'linkedin_message')
+    add_outreach(items, skip={norm(r.get("company")) for r in history if r.get("trigger_event")})
 
     rows = items + history  # new rows first, older rows and their notes kept as they were
-    # Best score first (5 down to 1). Python's sort keeps the existing order for equal scores,
-    # so new rows stay above older rows with the same score.
     rows.sort(key=lambda x: -int(x.get("score") or 1))
     out_path = OUTPUT_FILE
+    
     if os.path.exists(OUTPUT_FILE) and not history_ok:
         out_path = timestamped()  # never overwrite a file we could not read
         print("The existing results file could not be read, so it is left untouched.")
+        
     try:
         f = open(out_path, "w", newline="", encoding="utf-8-sig")
     except PermissionError:  # the file is open in Excel
         out_path = timestamped()
         print(f"{OUTPUT_FILE} is open in Excel, so saving everything to {out_path} instead. Close Excel next time.")
         f = open(out_path, "w", newline="", encoding="utf-8-sig")
+        
     with f:
         w = csv.DictWriter(f, fieldnames=COLS, extrasaction="ignore")
         w.writeheader()
@@ -610,19 +586,27 @@ def main():
         i["extra"] = 0
         seen[key] = i
         unique.append(i)
+        
     print(f"\nNEW LEADS THIS RUN (score >= {MIN_LEAD_SCORE}): {len(unique)} companies from {len(leads)} articles\n" + "-" * 60)
+    
+    # 3. Print the new 4-Column Executive Brief to the terminal
     for i in unique[:20]:
         more = f"  (+{i['extra']} more article(s))" if i["extra"] else ""
         print(f"[{i['score']}] {i['company'] or '(company not extracted)'} | {i['location']} | {i['date']}{more}")
         print(f"    {i['title']}\n    {i['link']}")
-        if i.get("linkedin_url"):
-            print(f"    LinkedIn: {i['linkedin_url']}")
-        elif i.get("linkedin_search"):
-            print(f"    LinkedIn Search: {i['linkedin_search']}")
-        if i.get("linkedin_message"):
-            print(f"    Roles to contact: {i['target_roles']}\n    Draft message: {i['linkedin_message']}")
+        if i.get("trigger_event"):
+            print(f"    Article: {i.get('article_status', '')}")
+            print(f"    Trigger: {i['trigger_event']}")
+            print(f"    Scale: {i['scale']}")
+            print(f"    Key Players: {i['key_players']}")
+            print(f"    Angle: {i['angle']}")
+        if i.get("linkedin_company_search"):
+            print(f"    Company Search: {i['linkedin_company_search']}")
+        if i.get("linkedin_people_search"):
+            print(f"    People Search: {i['linkedin_people_search']}")
         print()
+        
     print(f"Saved to {out_path} ({len(rows)} rows in total)")
-
+    
 if __name__ == "__main__":
     main()
