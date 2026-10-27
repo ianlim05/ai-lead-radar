@@ -37,10 +37,10 @@ OUTPUT_FILE = "results.csv"
 MALAYSIA_SITES = ["thestar.com.my", "theedgemalaysia.com", "nst.com.my", "malaymail.com", "bernama.com"]
 DAYS = 30
 MIN_LEAD_SCORE = 4  # Only output high-quality leads (4 or 5) to the terminal
-MAX_AI_CALLS = 60
+MAX_AI_CALLS = 100
 COMPANY_ALIASES = {"tp": "Teleperformance"}  # same company under different names in the news (lowercase key)
 OUTREACH_MIN_SCORE = 4   # only leads at this score or higher get target roles and a draft message
-MAX_OUTREACH_CALLS = 15  # max companies drafted per run (protects the free AI quota)
+MAX_DEEP_RESEARCH = 15  # max companies drafted per run (protects the free AI quota)
 YOUR_COMPANY = "Agos Asia Sdn Bhd"  # who the draft message says the sender works for
 USE_BING = True  # Bing News RSS as a second search source (adds results Google News does not show)
 
@@ -307,7 +307,7 @@ def add_outreach(items, skip=()):
         if i["score"] >= OUTREACH_MIN_SCORE and key and key not in seen and key not in skip:
             seen.add(key)
             todo.append(i)
-    todo = todo[:MAX_OUTREACH_CALLS]
+    todo = todo[:MAX_DEEP_RESEARCH]
     print(f"\nResearching {len(todo)} companies (reading articles and building cheat sheets)...")
     fails = 0
     for i in todo:
