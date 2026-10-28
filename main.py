@@ -190,17 +190,10 @@ def fetch_article_text(url):
         if out.get("ok") and out.get("items"):
             text = str(out["items"][0].get("text", ""))
         else:
-            print(f"    Agent-Reach could not read it: {str(out)[:200]}")
+            print("    Agent-Reach could not read it, handing off to browser...")
     except Exception as e:
         print(f"    Agent-Reach error: {e}")
-    if len(text) < 500:  # fall back to Jina Reader directly
-        try:
-            r = requests.get("https://r.jina.ai/" + url, headers={"Accept": "text/plain"}, timeout=40)
-            print(f"    Jina fallback: HTTP {r.status_code}, {len(r.text)} chars")
-            if r.status_code == 200:
-                text = r.text
-        except Exception as e:
-            print(f"    Jina fallback error: {e}")
+        
     return text[:8000]
 
 def fetch_article_text_playwright(url):
@@ -252,7 +245,7 @@ def find_publisher_link(title, company=""):
             r = requests.get("https://www.bing.com/news/search", params={"q": query, "format": "rss"},
                              headers=HEADERS, timeout=30)
             best, best_score = "", 0
-            for it in parse_rss(r.content, "BingNews", days=30):
+            for it in parse_rss(r.content, "BingNews"):
                 if "news.google.com" in it["link"]:
                     continue
                 t_words = {w for w in re.findall(r"[a-z0-9]+", it["title"].lower()) if len(w) > 3}
