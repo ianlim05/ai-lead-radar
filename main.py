@@ -62,303 +62,20 @@ GEMINI_MODELS = ["gemini-3.8-flash", "gemini-flash-lite-latest"]
 TOPIC = []
 ACTION = []
 
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+RELEVANT = re.compile(r"shared services|global business services|global capability|capability cent|"
+                      r"centre of excellence|center of excellence|\b(gbs|gcc|coe)\b", re.I)
+
+COLS = ["score", "company", "location", "signal", "trigger_event", "scale", "key_players", "angle",
+        "article_status", "outreach_status", "linkedin_company_search", "linkedin_people_search",
+        "title", "link", "date", "first_seen", "source", "origin"]
+
 def norm(s):
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())[:80]
 
 def clean_company(name):
     name = (name or "").strip()
     return COMPANY_ALIASES.get(name.lower(), name)
-
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-RELEVANT = re.compile(r"shared services|global business services|global capability|capability cent|"
-                      r"centre of excellence|center of excellence|\b(gbs|gcc|coe)\b", re.I)
-
-def parse_rss(content, origin, relevant_only=False):
-    """Read an RSS 2.0 feed. Drops items older than DAYS. Optionally keeps only topic-related items."""
-    root = ET.fromstring(content)
-    cutoff = datetime.now(timezone.utc) - timedelta(days=DAYS)
-    out = []
-    for it in root.iter("item"):
-        title = (it.findtext("title") or "").strip()
-        link = (it.findtext("link") or "").strip()
-        if not title or not link:
-            continue
-        if relevant_only:
-            text = title + " " + re.sub(r"<[^>]+>", " ", it.findtext("description") or "")
-            if not RELEVANT.search(text):
-                continue
-        date = ""
-        pub = it.findtext("pubDate")
-        if pub:
-            try:
-                d = parsedate_to_datetime(pub)
-                if d.tzinfo is None:
-                    d = d.replace(tzinfo=timezone.utc)
-                if d < cutoff:
-                    continue
-                date = d.strftime("%Y-%m-%d")
-            except (TypeError, ValueError):
-                pass
-        source = (it.findtext("source") or "").strip()
-        if not source:
-            for child in it:  # Bing puts the publisher in a namespaced <Source> tag
-                if child.tag.lower().split("}")[-1] == "source":
-                    source = (child.text or "").strip()
-        if "bing.com/news/apiclick" in link:  # use the real article address, not Bing's redirect
-            real = parse_qs(urlparse(link).query).get("url")
-            if real:
-                link = real[0]
-        out.append({"date": date, "title": title, "source": source, "link": link, "origin": origin})
-    return out
-
-def fetch_gnews(query):
-    params = {"q": f"{query} when:{DAYS}d", "hl": "en-MY", "gl": "MY", "ceid": "MY:en"}
-    r = requests.get("https://news.google.com/rss/search", params=params, headers=HEADERS, timeout=40)
-    return parse_rss(r.content, "GoogleNews")
-
-def fetch_bing(query):
-    out = []
-    for q in (query, query + " loc:my"):  # second pass limits Bing to Malaysian news sources
-        r = requests.get("https://www.bing.com/news/search", params={"q": q, "format": "rss"},
-                         headers=HEADERS, timeout=40)
-        out += parse_rss(r.content, "BingNews")
-        time.sleep(1.5)
-    return out
-
-def rule_score(title):
-    """Free fallback: 4 if topic + action words, 2 if topic only, else 1."""
-    t = title.lower()
-    topic = any(k in t for k in TOPIC) or re.search(r"\b(gbs|coe)\b", t)
-    action = any(k in t for k in ACTION)
-    if topic and action:
-        return 4
-    return 2 if topic else 1
-
-def ai_score(title):
-    prompt = (
-        'From this news headline, return ONE JSON object (not a list), no other text: {"company": the organisation that will own the centre (if a vendor builds it for a client, give only the client\'s name), '
-        '"signal": short phrase on whether the company is planning/setting up a GBS, shared services '
-        'centre, global capability centre or COE, "location": string, "score": integer 1-5 for how '
-        'strong a sales lead this is. Scoring rules: 5 = a named company clearly announces setting up or expanding its OWN GBS, '
-        'shared services centre, global capability centre or COE; 3-4 = likely plans, or hiring or a site expansion for such a '
-        'centre; 2 = a vendor or outsourcing deal, or a relevant company only mentioned in passing; 1 = executive '
-        'appointments, reports, surveys, commentary, government news or anything unrelated. '
-        'A "Centre of Excellence" counts only if it is an internal shared-services or operations centre; '
-        "a technology vendor's own AI or innovation lab for customers scores 2.}. "
-        "Headline: " + title
-    )
-    return gemini_json(prompt)
-
-def gemini_json(prompt):
-    last = ""
-    for model in GEMINI_MODELS:
-        for attempt in range(2):
-            try:
-                r = requests.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                    headers={"x-goog-api-key": GEMINI_KEY},
-                    json={"contents": [{"parts": [{"text": prompt}]}],
-                          "generationConfig": {"responseMimeType": "application/json"}},
-                    timeout=45,
-                )
-            except requests.exceptions.RequestException as e:
-                last = f"{model}: {type(e).__name__}"
-                time.sleep(8)
-                continue
-            if r.status_code == 429:  # quota used up for this model, try the next model
-                last = f"{model}: 429 {r.text[:200]}"
-                break
-            if r.status_code in (500, 502, 503, 504):  # Google is busy, temporary
-                last = f"{model}: {r.status_code} busy"
-                time.sleep(8)
-                continue
-            if r.status_code != 200:  # key or model problem, retrying will not help
-                raise PermissionError(f"Gemini error {r.status_code} on {model}: {r.text[:250]}")
-            data = json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
-            if isinstance(data, list):  # sometimes the model wraps the answer in a list
-                data = data[0] if data else {}
-            if not isinstance(data, dict):
-                raise ValueError("unexpected AI reply format")
-            return data
-    raise ConnectionError("Gemini is busy, over its free quota, or unreachable (" + last + ")")
-
-def fetch_article_text(url):
-    text = ""
-    print(f"    reading: {url}")
-    try:
-        out = run_action(WebChannel(), "read", {"target": url}, timeout=25.0)
-        if out.get("ok") and out.get("items"):
-            text = str(out["items"][0].get("text", ""))
-        else:
-            print("    Agent-Reach could not read it, handing off to browser...")
-    except Exception as e:
-        print(f"    Agent-Reach error: {e}")
-        
-    return text[:8000]
-
-def fetch_article_text_playwright(url):
-    """Open a page in a normal headless browser. Follows Google News redirects. Returns (final_url, text)."""
-    from playwright.sync_api import sync_playwright
-    final_url, text = url, ""
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        try:
-            page = browser.new_page()
-            page.goto(url, timeout=30000, wait_until="domcontentloaded")
-            try:  # a Google News link redirects to the publisher; wait until we leave news.google.com
-                page.wait_for_url(lambda u: "news.google.com" not in u, timeout=10000)
-            except Exception:
-                pass
-            page.wait_for_timeout(1500)
-            final_url = page.url
-            el = page.query_selector("article") or page.query_selector("main") or page.query_selector("body")
-            text = " ".join((el.inner_text() if el else "").split())
-        finally:
-            browser.close()
-    return final_url, text
-
-
-def generate_executive_brief(i, article_text):
-    note = ""
-    if len(article_text) < 500:
-        note = "\nArticle text is NOT available. Use only the headline, write Not stated for scale, and use an empty list for key_players."
-    prompt = (
-        'Analyze the provided news article and return ONE JSON object with EXACTLY these four keys: '
-        '"trigger_event" (1-sentence summary of the launch/expansion), '
-        '"scale" (exact numbers for headcount/investment. If none, write "Not stated"), '
-        '"key_players" (a list of objects like {"name": "...", "title": "..."} for each executive named or quoted in the article, or an empty list), '
-        '"angle" (1 sentence that must cite a specific fact from the article, such as headcount, function or location; if there is none, write "Not enough detail").\n'
-        'CRITICAL RULE: Do not invent names or numbers. If a number is not in the text, write "Not stated". '
-        'If no executive is named, use an empty list.\n\n'
-        f"Company: {i.get('company', '')}\nHeadline: {i.get('title', '')}\nArticle: {article_text}"
-        f"{note}\n"
-    )
-    return gemini_json(prompt)
-
-def find_publisher_link(title, company=""):
-    """Google News links cannot be read. Find the same story on Bing to get the real article address."""
-    clean = re.sub(r"\s+-\s+[^-]+$", "", title)
-    kw = [w for w in re.findall(r"[a-z0-9]+", clean.lower()) if len(w) > 3]
-    words = set(kw)
-    for query in (f'"{clean}"', clean, f"{company} {' '.join(kw[:6])}".strip()):
-        try:
-            r = requests.get("https://www.bing.com/news/search", params={"q": query, "format": "rss"},
-                             headers=HEADERS, timeout=30)
-            best, best_score = "", 0
-            for it in parse_rss(r.content, "BingNews"):
-                if "news.google.com" in it["link"]:
-                    continue
-                t_words = {w for w in re.findall(r"[a-z0-9]+", it["title"].lower()) if len(w) > 3}
-                overlap = len(words & t_words) / max(1, len(words))
-                if overlap > best_score:
-                    best, best_score = it["link"], overlap
-            if best_score >= 0.5:
-                print(f"    publisher link found ({best_score:.0%} match): {best}")
-                return best
-        except Exception as e:
-            print(f"    Bing lookup error: {e}")
-    print("    no publisher link found on Bing")
-    return ""
-
-def apply_players(i, j, article_text):
-    """Keep only executives that really appear in the article text."""
-    players = j.get("key_players", [])
-    if not isinstance(players, list):
-        players = []
-    players = [p for p in players if isinstance(p, dict) and str(p.get("name", "")).strip()]
-    players = [p for p in players if p["name"].strip().lower() in article_text.lower()]
-    i["key_players"] = "; ".join(f'{p["name"].strip()} ({str(p.get("title", "")).strip()})' for p in players) or "Not stated"
-    i["first_contact_name"] = players[0]["name"].strip() if players else ""
-
-def build_linkedin_link(i):
-    company = i.get("company", "")
-    name = i.get("first_contact_name", "")
-    
-    company_search = ""
-    people_search = ""
-    
-    if company:
-        # 1. LinkedIn Company Keyword Search (100% reliable)
-        company_search = f"https://www.linkedin.com/search/results/companies/?keywords={urllib.parse.quote(company)}"
-        
-        # 2. LinkedIn People Search (Finds the executives)
-        if name:
-            people_search = f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(f'{name} {company}')}"
-        else:
-            people_search = f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(company)}"
-            
-    return company_search, people_search
-
-def add_outreach(items, skip=()):
-    """Items must already be sorted best score first. One draft per company."""
-    if not GEMINI_KEY:
-        print("No GEMINI_API_KEY set: skipping target roles and draft messages.")
-        return
-    seen, todo = set(), []
-    for i in items:
-        key = norm(i["company"])
-        if i["score"] >= OUTREACH_MIN_SCORE and key and key not in seen and key not in skip:
-            seen.add(key)
-            todo.append(i)
-    todo = todo[:MAX_DEEP_RESEARCH]
-    print(f"\nResearching {len(todo)} companies (reading articles and building cheat sheets)...")
-    fails = 0
-    for i in todo:
-        try:
-            print(f"  Deep researching {i['company']}...")
-            
-            # 1. Use the new Bing lookup to resolve Google News redirects to real publisher URLs
-            url = find_publisher_link(i["title"], i.get("company", "")) if "news.google.com" in i["link"] else i["link"]
-            
-            # 2. Try the primary Agent-Reach stealth reader
-            article_text = fetch_article_text(url or i["link"])
-            
-            # 3. If it failed to get sufficient text, fallback to the standard Playwright browser reader
-            if len(article_text) < 500:
-                try:
-                    final_url, article_text = fetch_article_text_playwright(url or i["link"])
-                    print(f"    browser reader: {len(article_text)} chars from {final_url[:80]}")
-                except Exception as e:
-                    print(f"    browser reader error: {type(e).__name__}")
-                    article_text = ""
-            
-            article_text = article_text[:8000]
-            
-            i["article_status"] = f"full text ({len(article_text)} chars)" if len(article_text) > 500 else "headline only"
-            print(f"    article: {i['article_status']}")
-            
-            # Get the JSON dictionary from Gemini
-            j_raw = generate_executive_brief(i, article_text)
-            print("    [DEBUG] AI Output:", j_raw)  
-            
-            # Safely extract the strings
-            i["trigger_event"] = str(j_raw.get("trigger_event", ""))
-            i["scale"] = str(j_raw.get("scale", ""))
-            
-            # MUST call this to verify the names and set i["first_contact_name"] for the LinkedIn link
-            apply_players(i, j_raw, article_text)
-            
-            if i["article_status"] == "headline only":
-                i["angle"] = "Not enough detail (article could not be read)"
-            else:
-                i["angle"] = str(j_raw.get("angle", ""))
-                
-            # Generate the two new separated LinkedIn links
-            comp_search, people_link = build_linkedin_link(i)
-            i["linkedin_company_search"] = comp_search
-            i["linkedin_people_search"] = people_link
-            i["outreach_status"] = "New"
-            fails = 0
-        except PermissionError as e:
-            print("   ", e)
-            break
-        except Exception as e:
-            fails += 1
-            print("   Could not draft for", i["company"], ":", e)
-            if fails >= 3:
-                print("   3 failures in a row. Stopping, please run again in a few minutes.")
-                break
-        time.sleep(5)
 
 def load_excel_config():
     """
@@ -454,6 +171,58 @@ def collect():
     print("Collected per source (before removing duplicates):", dict(counts))
     return items
 
+def fetch_gnews(query):
+    params = {"q": f"{query} when:{DAYS}d", "hl": "en-MY", "gl": "MY", "ceid": "MY:en"}
+    r = requests.get("https://news.google.com/rss/search", params=params, headers=HEADERS, timeout=40)
+    return parse_rss(r.content, "GoogleNews")
+
+def fetch_bing(query):
+    out = []
+    for q in (query, query + " loc:my"):  # second pass limits Bing to Malaysian news sources
+        r = requests.get("https://www.bing.com/news/search", params={"q": q, "format": "rss"},
+                         headers=HEADERS, timeout=40)
+        out += parse_rss(r.content, "BingNews")
+        time.sleep(1.5)
+    return out
+
+def parse_rss(content, origin, relevant_only=False):
+    """Read an RSS 2.0 feed. Drops items older than DAYS. Optionally keeps only topic-related items."""
+    root = ET.fromstring(content)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=DAYS)
+    out = []
+    for it in root.iter("item"):
+        title = (it.findtext("title") or "").strip()
+        link = (it.findtext("link") or "").strip()
+        if not title or not link:
+            continue
+        if relevant_only:
+            text = title + " " + re.sub(r"<[^>]+>", " ", it.findtext("description") or "")
+            if not RELEVANT.search(text):
+                continue
+        date = ""
+        pub = it.findtext("pubDate")
+        if pub:
+            try:
+                d = parsedate_to_datetime(pub)
+                if d.tzinfo is None:
+                    d = d.replace(tzinfo=timezone.utc)
+                if d < cutoff:
+                    continue
+                date = d.strftime("%Y-%m-%d")
+            except (TypeError, ValueError):
+                pass
+        source = (it.findtext("source") or "").strip()
+        if not source:
+            for child in it:  # Bing puts the publisher in a namespaced <Source> tag
+                if child.tag.lower().split("}")[-1] == "source":
+                    source = (child.text or "").strip()
+        if "bing.com/news/apiclick" in link:  # use the real article address, not Bing's redirect
+            real = parse_qs(urlparse(link).query).get("url")
+            if real:
+                link = real[0]
+        out.append({"date": date, "title": title, "source": source, "link": link, "origin": origin})
+    return out
+
 def dedupe(items):
     seen_links, seen_titles, out = set(), set(), []
     for i in items:
@@ -500,9 +269,239 @@ def score_all(items):
         ai_calls += 1
         time.sleep(5)
 
-COLS = ["score", "company", "location", "signal", "trigger_event", "scale", "key_players", "angle",
-        "article_status", "outreach_status", "linkedin_company_search", "linkedin_people_search",
-        "title", "link", "date", "first_seen", "source", "origin"]
+def rule_score(title):
+    """Free fallback: 4 if topic + action words, 2 if topic only, else 1."""
+    t = title.lower()
+    topic = any(k in t for k in TOPIC) or re.search(r"\b(gbs|coe)\b", t)
+    action = any(k in t for k in ACTION)
+    if topic and action:
+        return 4
+    return 2 if topic else 1
+
+def ai_score(title):
+    prompt = (
+        'From this news headline, return ONE JSON object (not a list), no other text: {"company": the organisation that will own the centre (if a vendor builds it for a client, give only the client\'s name), '
+        '"signal": short phrase on whether the company is planning/setting up a GBS, shared services '
+        'centre, global capability centre or COE, "location": string, "score": integer 1-5 for how '
+        'strong a sales lead this is. Scoring rules: 5 = a named company clearly announces setting up or expanding its OWN GBS, '
+        'shared services centre, global capability centre or COE; 3-4 = likely plans, or hiring or a site expansion for such a '
+        'centre; 2 = a vendor or outsourcing deal, or a relevant company only mentioned in passing; 1 = executive '
+        'appointments, reports, surveys, commentary, government news or anything unrelated. '
+        'A "Centre of Excellence" counts only if it is an internal shared-services or operations centre; '
+        "a technology vendor's own AI or innovation lab for customers scores 2.}. "
+        "Headline: " + title
+    )
+    return gemini_json(prompt)
+
+def gemini_json(prompt):
+    last = ""
+    for model in GEMINI_MODELS:
+        for attempt in range(2):
+            try:
+                r = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                    headers={"x-goog-api-key": GEMINI_KEY},
+                    json={"contents": [{"parts": [{"text": prompt}]}],
+                          "generationConfig": {"responseMimeType": "application/json"}},
+                    timeout=45,
+                )
+            except requests.exceptions.RequestException as e:
+                last = f"{model}: {type(e).__name__}"
+                time.sleep(8)
+                continue
+            if r.status_code == 429:  # quota used up for this model, try the next model
+                last = f"{model}: 429 {r.text[:200]}"
+                break
+            if r.status_code in (500, 502, 503, 504):  # Google is busy, temporary
+                last = f"{model}: {r.status_code} busy"
+                time.sleep(8)
+                continue
+            if r.status_code != 200:  # key or model problem, retrying will not help
+                raise PermissionError(f"Gemini error {r.status_code} on {model}: {r.text[:250]}")
+            data = json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+            if isinstance(data, list):  # sometimes the model wraps the answer in a list
+                data = data[0] if data else {}
+            if not isinstance(data, dict):
+                raise ValueError("unexpected AI reply format")
+            return data
+    raise ConnectionError("Gemini is busy, over its free quota, or unreachable (" + last + ")")
+
+def add_outreach(items, skip=()):
+    """Items must already be sorted best score first. One draft per company."""
+    if not GEMINI_KEY:
+        print("No GEMINI_API_KEY set: skipping target roles and draft messages.")
+        return
+    seen, todo = set(), []
+    for i in items:
+        key = norm(i["company"])
+        if i["score"] >= OUTREACH_MIN_SCORE and key and key not in seen and key not in skip:
+            seen.add(key)
+            todo.append(i)
+    todo = todo[:MAX_DEEP_RESEARCH]
+    print(f"\nResearching {len(todo)} companies (reading articles and building cheat sheets)...")
+    fails = 0
+    for i in todo:
+        try:
+            print(f"  Deep researching {i['company']}...")
+            
+            # 1. Use the new Bing lookup to resolve Google News redirects to real publisher URLs
+            url = find_publisher_link(i["title"], i.get("company", "")) if "news.google.com" in i["link"] else i["link"]
+            
+            # 2. Try the primary Agent-Reach stealth reader
+            article_text = fetch_article_text(url or i["link"])
+            
+            # 3. If it failed to get sufficient text, fallback to the standard Playwright browser reader
+            if len(article_text) < 500:
+                try:
+                    final_url, article_text = fetch_article_text_playwright(url or i["link"])
+                    print(f"    browser reader: {len(article_text)} chars from {final_url[:80]}")
+                except Exception as e:
+                    print(f"    browser reader error: {type(e).__name__}")
+                    article_text = ""
+            
+            article_text = article_text[:8000]
+            
+            i["article_status"] = f"full text ({len(article_text)} chars)" if len(article_text) > 500 else "headline only"
+            print(f"    article: {i['article_status']}")
+            
+            # Get the JSON dictionary from Gemini
+            j_raw = generate_executive_brief(i, article_text)
+            print("    [DEBUG] AI Output:", j_raw)  
+            
+            # Safely extract the strings
+            i["trigger_event"] = str(j_raw.get("trigger_event", ""))
+            i["scale"] = str(j_raw.get("scale", ""))
+            
+            # MUST call this to verify the names and set i["first_contact_name"] for the LinkedIn link
+            apply_players(i, j_raw, article_text)
+            
+            if i["article_status"] == "headline only":
+                i["angle"] = "Not enough detail (article could not be read)"
+            else:
+                i["angle"] = str(j_raw.get("angle", ""))
+                
+            # Generate the two new separated LinkedIn links
+            comp_search, people_link = build_linkedin_link(i)
+            i["linkedin_company_search"] = comp_search
+            i["linkedin_people_search"] = people_link
+            i["outreach_status"] = "New"
+            fails = 0
+        except PermissionError as e:
+            print("   ", e)
+            break
+        except Exception as e:
+            fails += 1
+            print("   Could not draft for", i["company"], ":", e)
+            if fails >= 3:
+                print("   3 failures in a row. Stopping, please run again in a few minutes.")
+                break
+        time.sleep(5)
+
+def find_publisher_link(title, company=""):
+    """Google News links cannot be read. Find the same story on Bing to get the real article address."""
+    clean = re.sub(r"\s+-\s+[^-]+$", "", title)
+    kw = [w for w in re.findall(r"[a-z0-9]+", clean.lower()) if len(w) > 3]
+    words = set(kw)
+    for query in (f'"{clean}"', clean, f"{company} {' '.join(kw[:6])}".strip()):
+        try:
+            r = requests.get("https://www.bing.com/news/search", params={"q": query, "format": "rss"},
+                             headers=HEADERS, timeout=30)
+            best, best_score = "", 0
+            for it in parse_rss(r.content, "BingNews"):
+                if "news.google.com" in it["link"]:
+                    continue
+                t_words = {w for w in re.findall(r"[a-z0-9]+", it["title"].lower()) if len(w) > 3}
+                overlap = len(words & t_words) / max(1, len(words))
+                if overlap > best_score:
+                    best, best_score = it["link"], overlap
+            if best_score >= 0.5:
+                print(f"    publisher link found ({best_score:.0%} match): {best}")
+                return best
+        except Exception as e:
+            print(f"    Bing lookup error: {e}")
+    print("    no publisher link found on Bing")
+    return ""
+
+def fetch_article_text(url):
+    text = ""
+    print(f"    reading: {url}")
+    try:
+        out = run_action(WebChannel(), "read", {"target": url}, timeout=25.0)
+        if out.get("ok") and out.get("items"):
+            text = str(out["items"][0].get("text", ""))
+        else:
+            print("    Agent-Reach could not read it, handing off to browser...")
+    except Exception as e:
+        print(f"    Agent-Reach error: {e}")
+        
+    return text[:8000]
+
+def fetch_article_text_playwright(url):
+    """Open a page in a normal headless browser. Follows Google News redirects. Returns (final_url, text)."""
+    from playwright.sync_api import sync_playwright
+    final_url, text = url, ""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.goto(url, timeout=30000, wait_until="domcontentloaded")
+            try:  # a Google News link redirects to the publisher; wait until we leave news.google.com
+                page.wait_for_url(lambda u: "news.google.com" not in u, timeout=10000)
+            except Exception:
+                pass
+            page.wait_for_timeout(1500)
+            final_url = page.url
+            el = page.query_selector("article") or page.query_selector("main") or page.query_selector("body")
+            text = " ".join((el.inner_text() if el else "").split())
+        finally:
+            browser.close()
+    return final_url, text
+
+def generate_executive_brief(i, article_text):
+    note = ""
+    if len(article_text) < 500:
+        note = "\nArticle text is NOT available. Use only the headline, write Not stated for scale, and use an empty list for key_players."
+    prompt = (
+        'Analyze the provided news article and return ONE JSON object with EXACTLY these four keys: '
+        '"trigger_event" (1-sentence summary of the launch/expansion), '
+        '"scale" (exact numbers for headcount/investment. If none, write "Not stated"), '
+        '"key_players" (a list of objects like {"name": "...", "title": "..."} for each executive named or quoted in the article, or an empty list), '
+        '"angle" (1 sentence that must cite a specific fact from the article, such as headcount, function or location; if there is none, write "Not enough detail").\n'
+        'CRITICAL RULE: Do not invent names or numbers. If a number is not in the text, write "Not stated". '
+        'If no executive is named, use an empty list.\n\n'
+        f"Company: {i.get('company', '')}\nHeadline: {i.get('title', '')}\nArticle: {article_text}"
+        f"{note}\n"
+    )
+    return gemini_json(prompt)
+
+def apply_players(i, j, article_text):
+    """Keep only executives that really appear in the article text."""
+    players = j.get("key_players", [])
+    if not isinstance(players, list):
+        players = []
+    players = [p for p in players if isinstance(p, dict) and str(p.get("name", "")).strip()]
+    players = [p for p in players if p["name"].strip().lower() in article_text.lower()]
+    i["key_players"] = "; ".join(f'{p["name"].strip()} ({str(p.get("title", "")).strip()})' for p in players) or "Not stated"
+    i["first_contact_name"] = players[0]["name"].strip() if players else ""
+
+def build_linkedin_link(i):
+    company = i.get("company", "")
+    name = i.get("first_contact_name", "")
+    
+    company_search = ""
+    people_search = ""
+    
+    if company:
+        # 1. LinkedIn Company Keyword Search (100% reliable)
+        company_search = f"https://www.linkedin.com/search/results/companies/?keywords={urllib.parse.quote(company)}"
+        
+        # 2. LinkedIn People Search (Finds the executives)
+        if name:
+            people_search = f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(f'{name} {company}')}"
+        else:
+            people_search = f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote(company)}"
+            
+    return company_search, people_search
 
 def load_history():
     """Read the existing results file, so old leads and the salesperson's notes are kept."""
