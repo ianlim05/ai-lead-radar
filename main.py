@@ -646,6 +646,11 @@ def main():
 
     rows = items + history  # new rows first, older rows and their notes kept as they were
     rows.sort(key=lambda x: -int(float(x.get("score") or 0)))
+    
+    # Format '0' scores as 'Not Scored' for the CSV output
+    for r in rows:
+        if str(r.get("score")) == "0":
+            r["score"] = "Not Scored"
     out_path = OUTPUT_FILE
     
     if os.path.exists(OUTPUT_FILE) and not history_ok:
@@ -679,8 +684,9 @@ def main():
     
     # 3. Print the new 4-Column Executive Brief to the terminal
     for i in unique[:20]:
-        more = f"  (+{i['extra']} more article(s))" if i["extra"] else ""
-        print(f"[{i['score']}] {i['company'] or '(company not extracted)'} | {i['location']} | {i['date']}{more}")
+        display_score = "Not Scored" if str(i.get('score')) == "0" else i['score']
+        more = f"  ({i['extra']} more article(s))" if i['extra'] else ""
+        print(f"[{display_score}] {i['company'] or '(company not extracted)'} | {i['location']} | {i['date']}{more}")
         print(f"    {i['title']}\n    {i['link']}")
         if i.get("trigger_event"):
             print(f"    Article: {i.get('article_status', '')}")
