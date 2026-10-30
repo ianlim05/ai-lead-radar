@@ -27,6 +27,7 @@ from email.utils import parsedate_to_datetime
 import requests
 from agent_reach.channels.web import WebChannel
 from agent_reach.runtime.dispatch import run_action
+import win32com.client
 
 # ---------- SETTINGS (edit these) ----------
 # Keywords come from this Excel file if it exists (sheet "Keywords": column A = Keyword, column B = Active Yes/No).
@@ -35,7 +36,7 @@ OUTPUT_FILE = "results.csv"
 
 # Malaysian outlets, searched through Google News with a site: filter
 MALAYSIA_SITES = ["thestar.com.my", "theedgemalaysia.com", "nst.com.my", "malaymail.com", "bernama.com"]
-DAYS = 30
+DAYS = 7
 MIN_LEAD_SCORE = 4  # Only output high-quality leads (4 or 5) to the terminal
 MAX_AI_CALLS = 100
 COMPANY_ALIASES = {"tp": "Teleperformance"}  # same company under different names in the news (lowercase key)
@@ -79,11 +80,9 @@ def clean_company(name):
 
 def load_excel_config():
     """
-    Reads Keywords, Topics, and Actions directly from GBS Keywords.xlsx.
+    Reads Keywords directly from GBS Keywords.xlsx.
     Non-technical users can customize everything without touching Python code.
     """
-    global TOPIC, ACTION
-    
     if not os.path.exists(KEYWORDS_FILE):
         print(f"Keyword file not found ({KEYWORDS_FILE}). Please create it.")
         return []
@@ -92,37 +91,18 @@ def load_excel_config():
         from openpyxl import load_workbook
         wb = load_workbook(KEYWORDS_FILE, read_only=True, data_only=True)
         
-        # 1. Load Search Keywords
         keywords = []
         ws_kw = wb["Keywords"] if "Keywords" in wb.sheetnames else wb.active
+        
         for row in ws_kw.iter_rows(min_row=2, values_only=True):
             kw = str(row[0]).strip() if row and row[0] else ""
             active = str(row[1]).strip().lower() if len(row) > 1 and row[1] is not None else "yes"
+            
             if kw and active not in ("no", "n", "false", "0"):
                 keywords.append(kw)
                 
-        # 2. Load Topics (if sheet exists)
-        if "Topics" in wb.sheetnames:
-            custom_topics = [
-                str(row[0]).strip().lower() 
-                for row in wb["Topics"].iter_rows(min_row=2, values_only=True) 
-                if row and row[0]
-            ]
-            if custom_topics:
-                TOPIC = custom_topics
-
-        # 3. Load Actions (if sheet exists)
-        if "Actions" in wb.sheetnames:
-            custom_actions = [
-                str(row[0]).strip().lower() 
-                for row in wb["Actions"].iter_rows(min_row=2, values_only=True) 
-                if row and row[0]
-            ]
-            if custom_actions:
-                ACTION = custom_actions
-
         wb.close()
-        print(f"Loaded {len(keywords)} keywords, {len(TOPIC)} topics, and {len(ACTION)} actions from Excel.")
+        print(f"Loaded {len(keywords)} active keywords from Excel.")
         return keywords
 
     except ImportError:
@@ -142,6 +122,11 @@ def collect():
             items += fetch_gnews(k)
         except Exception as e:
             print("   Google News error:", e)
+            
+        try:
+            items += fetch_tinyfish(k)
+        except Exception as e:
+            print("   TinyFish error:", e)
         if USE_BING:
             try:
                 items += fetch_bing(k)
@@ -183,6 +168,67 @@ def fetch_bing(query):
                          headers=HEADERS, timeout=40)
         out += parse_rss(r.content, "BingNews")
         time.sleep(1.5)
+    return out
+
+def fetch_tinyfish(query):
+    """Hunts for corporate blogs and PDFs using TinyFish with strict noise filters."""
+    api_key = os.getenv("TINYFISH_API_KEY")
+    if not api_key:
+        return [] 
+        
+    out = []
+    try:
+        # LAYER 1: Stricter API Query
+        # Forces TinyFish to look for actual announcements and avoid general chatter
+        advanced_query = f'{query} AND ("press release" OR announces OR launches OR expansion OR "new office")'
+        
+        # 1-month date filter to balance freshness and API quota
+        thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+        
+        r = requests.get(
+            "https://api.search.tinyfish.ai", 
+            headers={"X-API-Key": api_key},
+            params={
+                "query": advanced_query,
+                "after_date": thirty_days_ago
+            },
+            timeout=30
+        )
+        if r.status_code != 200:
+            print(f"   TinyFish API error: {r.status_code} - {r.text}")
+            return []
+            
+        data = r.json()
+        
+        # LAYER 2: The Python Bouncer
+        # If any of these words are in the URL or Title, throw it in the trash immediately
+        junk_urls = ["job", "career", "workday", "taleo", "wiki", "glossary", "dictionary", "facebook.com", "instagram.com", "reddit.com", "outsourceaccelerator"]
+        junk_titles = ["what is", "meaning", "explained", "vs ", "vs.", "guide", "hiring", "apply now"]
+        
+        for item in data.get("results", []):
+            title = (item.get("title") or "").strip()
+            link = (item.get("url") or "").strip()
+            
+            link_lower = link.lower()
+            title_lower = title.lower()
+            
+            # Instantly block if a junk word is found
+            if any(junk in link_lower for junk in junk_urls):
+                continue
+            if any(junk in title_lower for junk in junk_titles):
+                continue
+                
+            if title and link:
+                out.append({
+                    "date": "", 
+                    "title": title, 
+                    "source": item.get("site_name", "TinyFish Corporate"), 
+                    "link": link, 
+                    "origin": "TinyFish"
+                })
+    except Exception as e:
+        print(f"   TinyFish error: {e}")
+        
     return out
 
 def parse_rss(content, origin, relevant_only=False):
@@ -250,8 +296,21 @@ def score_all(items):
             break
         try:
             j = ai_score(i["title"])
-            i.update({"company": clean_company(j.get("company")), "signal": j.get("signal", ""),
-                      "location": j.get("location", ""), "score": min(5, max(1, int(float(j.get("score") or i["score"]))))})
+            
+            # LAYER 3: The Empty Company Assassin
+            company_name = clean_company(j.get("company"))
+            if not company_name or company_name.lower() in ["", "none", "n/a", "not stated", "unknown"]:
+                print(f"   Skipping: Gemini found no company for {i['link']}")
+                fails = 0
+                continue  # Throws the article in the trash, does NOT save it to the CSV!
+                
+            # If it survives the assassin, it gets saved normally
+            i.update({
+                "company": company_name, 
+                "signal": j.get("signal", ""),
+                "location": j.get("location", ""), 
+                "score": min(5, max(1, int(float(j.get("score") or i["score"]))))
+            })
             fails = 0
         except RuntimeError:
             print("   Gemini rate limit hit, stopping AI scoring. Rule-based scores kept for the rest.")
@@ -270,13 +329,8 @@ def score_all(items):
         time.sleep(5)
 
 def rule_score(title):
-    """Free fallback: 4 if topic + action words, 2 if topic only, else 1."""
-    t = title.lower()
-    topic = any(k in t for k in TOPIC) or re.search(r"\b(gbs|coe)\b", t)
-    action = any(k in t for k in ACTION)
-    if topic and action:
-        return 4
-    return 2 if topic else 1
+    """Safety net fallback score. 0 indicates Gemini never scored the article."""
+    return 0
 
 def ai_score(title):
     prompt = (
@@ -326,17 +380,17 @@ def gemini_json(prompt):
             return data
     raise ConnectionError("Gemini is busy, over its free quota, or unreachable (" + last + ")")
 
-def add_outreach(items, skip=()):
-    """Items must already be sorted best score first. One draft per company."""
+def add_outreach(items):
+    """Items must already be sorted best score first."""
     if not GEMINI_KEY:
-        print("No GEMINI_API_KEY set: skipping target roles and draft messages.")
+        print("No GEMINI_API_KEY set: skipping deep research.")
         return
-    seen, todo = set(), []
+    
+    todo = []
     for i in items:
-        key = norm(i["company"])
-        if i["score"] >= OUTREACH_MIN_SCORE and key and key not in seen and key not in skip:
-            seen.add(key)
+        if i["score"] >= OUTREACH_MIN_SCORE:
             todo.append(i)
+            
     todo = todo[:MAX_DEEP_RESEARCH]
     print(f"\nResearching {len(todo)} companies (reading articles and building cheat sheets)...")
     fails = 0
@@ -517,14 +571,56 @@ def load_history():
     rows = [r for r in rows if (r.get("title") or r.get("link") or "").strip()]
     for r in rows:
         try:
-            r["score"] = int(float(r.get("score") or 1))
+            r["score"] = int(float(r.get("score") or 0))
         except ValueError:
-            r["score"] = 1
+            r["score"] = 0
     return rows, True
 
 def timestamped():
     base, ext = os.path.splitext(OUTPUT_FILE)
     return f"{base}_{datetime.now():%Y%m%d_%H%M%S}{ext}"
+
+def send_sales_email(leads):
+    """Packages high-scoring leads into an HTML email and sends via local Outlook app."""
+    if not leads:
+        return
+
+    print(f"\nPreparing email report for {len(leads)} leads...")
+    
+    # 1. Build the HTML email body
+    html = f"<h2 style='font-family: Arial;'>New GBS Leads Found: {datetime.now():%Y-%m-%d}</h2>"
+    for i in leads[:20]:
+        company = i.get('company') or 'Unknown Company'
+        html += f"""
+        <div style="font-family: Arial; margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px; background-color: #f9f9f9;">
+            <h3 style="margin-top: 0; color: #2c3e50;">[{i['score']}] {company} | {i['location']}</h3>
+            <p><strong>Trigger:</strong> {i.get('trigger_event', '')}</p>
+            <p><strong>Scale:</strong> {i.get('scale', '')}</p>
+            <p><strong>Key Players:</strong> {i.get('key_players', '')}</p>
+            <p><strong>Angle:</strong> {i.get('angle', '')}</p>
+            <p style="margin-top: 15px;">
+                <a href="{i['link']}" style="background-color: #0073b1; color: white; padding: 5px 10px; text-decoration: none; border-radius: 3px; margin-right: 10px;">Read Article</a>
+                <a href="{i.get('linkedin_company_search', '')}" style="background-color: #0073b1; color: white; padding: 5px 10px; text-decoration: none; border-radius: 3px; margin-right: 10px;">Company LinkedIn</a>
+                <a href="{i.get('linkedin_people_search', '')}" style="background-color: #0073b1; color: white; padding: 5px 10px; text-decoration: none; border-radius: 3px;">People Search</a>
+            </p>
+        </div>
+        """
+
+    # 2. Connect to local Outlook and send
+    try:
+        outlook = win32com.client.Dispatch('outlook.application')
+        mail = outlook.CreateItem(0)  # 0 represents a standard Mail Item
+        
+        mail.To = "ianlim@agosasia.com"  # Separate multiple emails with a semicolon (;) for Outlook
+        mail.Subject = f"🚀 GBS Lead Radar: {len(leads)} New Qualified Leads"
+        mail.HTMLBody = html
+        
+        # mail.Display()  # Optional: Un-comment this line if you want to preview the email before it sends
+        mail.Send()
+        print("   Email successfully sent to the sales team via local Outlook!")
+        
+    except Exception as e:
+        print(f"   Failed to send email via Outlook: {e}")
 
 def main():
     history, history_ok = load_history()
@@ -545,11 +641,11 @@ def main():
     
     score_all(items)
     
-    # 2. Call the updated outreach function (Skip check now looks for 'trigger_event' instead of 'linkedin_message')
-    add_outreach(items, skip={norm(r.get("company")) for r in history if r.get("trigger_event")})
+    # 2. Call the updated outreach function
+    add_outreach(items)
 
     rows = items + history  # new rows first, older rows and their notes kept as they were
-    rows.sort(key=lambda x: -int(x.get("score") or 1))
+    rows.sort(key=lambda x: -int(float(x.get("score") or 0)))
     out_path = OUTPUT_FILE
     
     if os.path.exists(OUTPUT_FILE) and not history_ok:
@@ -599,6 +695,8 @@ def main():
         print()
         
     print(f"Saved to {out_path} ({len(rows)} rows in total)")
+
+    send_sales_email(unique)
     
 if __name__ == "__main__":
     main()
