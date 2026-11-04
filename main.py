@@ -1,7 +1,7 @@
 """
 GBS Lead Radar
-Searches Google News + Bing News (Malaysia focus) and extra RSS feeds for companies planning a GBS / shared services / COE.
-Scores leads 1-5, uses Playwright to extract public LinkedIn company metadata securely, and saves to results.csv.
+Searches Google News, Bing News, and TinyFish for companies planning a GBS / shared services / COE.
+Scores leads 1-5 using Gemini AI, extracts article text via Playwright/PyPDF2, generates safe LinkedIn search links, and emails a report via Outlook.
 
 Setup:  pip install requests openpyxl playwright pywin32 python-dotenv PyPDF2
         playwright install chromium
@@ -39,7 +39,17 @@ RECEIVER_EMAIL = "ianlim@agosasia.com"  # Use semicolons for multiple emails
 SENDER_EMAIL = "ianlim@agosasia.com"    # The exact Outlook account sending the email
 
 # Malaysian outlets, searched through Google News with a site: filter
-MALAYSIA_SITES = ["thestar.com.my", "theedgemalaysia.com", "nst.com.my", "malaymail.com", "bernama.com"]
+MALAYSIA_SITES = [
+    "thestar.com.my", 
+    "theedgemalaysia.com", 
+    "nst.com.my", 
+    "malaymail.com", 
+    "bernama.com", 
+    "digitalnewsasia.com", 
+    "businesstoday.com.my", 
+    "thesun.my", 
+    "klsescreener.com"
+]
 DAYS = 7
 MIN_LEAD_SCORE = 4  # Only output high-quality leads (4 or 5) to the terminal
 MAX_AI_CALLS = 200
@@ -59,14 +69,6 @@ JUNK_TITLES = [
     "what is", "meaning", "explained", "vs ", "vs.", "guide", "hiring", "apply now", 
     "report", "survey", "forecast", "results", "quarter", "earnings", "prospectus", 
     "appoints", "appointed", "names", "former", "steps down"
-]
-
-# Extra RSS feed addresses, one per line inside the brackets.
-EXTRA_RSS_FEEDS = [
-    "https://www.freemalaysiatoday.com/category/business/feed/",     # Free Malaysia Today, business
-    "https://www.malaymail.com/feed/rss/money",                      # Malay Mail, money
-    "https://www.techinasia.com/feed",                               # Tech in Asia
-    "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeGVpT",  # Business Wire Asia
 ]
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
@@ -155,19 +157,6 @@ def collect():
             items += fetch_gnews(q)
         except Exception as e:
             print("   Google News error:", e)
-    for url in EXTRA_RSS_FEEDS:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=40)
-            try:
-                got = parse_rss(r.content, "RSS:" + urlparse(url).netloc, relevant_only=True)
-            except ET.ParseError:
-                print(f"   Extra feed not readable (HTTP {r.status_code}): {url}")
-                print(f"   The reply starts with: {r.text[:100]!r}")
-                continue
-            print(f"  Extra feed {url}: {len(got)} relevant items")
-            items += got
-        except Exception as e:
-            print("   Extra feed error:", url, e)
     # --- THE UNIVERSAL BOUNCER ---
     clean_items = []
     for i in items:
