@@ -49,6 +49,18 @@ MAX_DEEP_RESEARCH = 30  # max companies drafted per run (protects the free AI qu
 YOUR_COMPANY = "Agos Asia Sdn Bhd"  # who the draft message says the sender works for
 USE_BING = True  # Bing News RSS as a second search source (adds results Google News does not show)
 
+JUNK_URLS = [
+    "job", "career", "workday", "taleo", "wiki", "glossary", "dictionary", 
+    "facebook.com", "instagram.com", "reddit.com", "outsourceaccelerator", 
+    "event", "summit", "linkedin.com/in/", "jooble", "workable.com", "sitemap"
+]
+
+JUNK_TITLES = [
+    "what is", "meaning", "explained", "vs ", "vs.", "guide", "hiring", "apply now", 
+    "report", "survey", "forecast", "results", "quarter", "earnings", "prospectus", 
+    "appoints", "appointed", "names", "former", "steps down"
+]
+
 # Extra RSS feed addresses, one per line inside the brackets.
 EXTRA_RSS_FEEDS = [
     "https://www.freemalaysiatoday.com/category/business/feed/",     # Free Malaysia Today, business
@@ -156,9 +168,22 @@ def collect():
             items += got
         except Exception as e:
             print("   Extra feed error:", url, e)
-    counts = Counter(i["origin"] for i in items)
+    # --- THE UNIVERSAL BOUNCER ---
+    clean_items = []
+    for i in items:
+        link_lower = i["link"].lower()
+        title_lower = i["title"].lower()
+        
+        if any(j in link_lower for j in JUNK_URLS):
+            continue
+        if any(j in title_lower for j in JUNK_TITLES):
+            continue
+            
+        clean_items.append(i)
+        
+    counts = Counter(i["origin"] for i in clean_items)
     print("Collected per source (before removing duplicates):", dict(counts))
-    return items
+    return clean_items
 
 def fetch_gnews(query):
     params = {"q": f"{query} when:{DAYS}d", "hl": "en-MY", "gl": "MY", "ceid": "MY:en"}
@@ -184,7 +209,7 @@ def fetch_tinyfish(query):
     try:
         # LAYER 1: Stricter API Query
         # Forces TinyFish to look for actual announcements and avoid general chatter
-        advanced_query = f'{query} AND ("press release" OR announces OR launches OR expansion OR "new office")'
+        advanced_query = f'{query} AND (opens OR opened OR inaugurates OR unveils OR establishes OR establishing OR launches OR expands OR expansion OR "new office" OR "regional hub" OR invests)'
         
         # Filter strictly to the weekly run cycle to prevent re-processing old junk
         recent_date = (datetime.now(timezone.utc) - timedelta(days=DAYS)).strftime("%Y-%m-%d")
@@ -204,24 +229,10 @@ def fetch_tinyfish(query):
             
         data = r.json()
         
-        # LAYER 2: The Python Bouncer
-        # If any of these words are in the URL or Title, throw it in the trash immediately
-        junk_urls = ["job", "career", "workday", "taleo", "wiki", "glossary", "dictionary", "facebook.com", "instagram.com", "reddit.com", "outsourceaccelerator"]
-        junk_titles = ["what is", "meaning", "explained", "vs ", "vs.", "guide", "hiring", "apply now"]
-        
         for item in data.get("results", []):
             title = (item.get("title") or "").strip()
             link = (item.get("url") or "").strip()
             
-            link_lower = link.lower()
-            title_lower = title.lower()
-            
-            # Instantly block if a junk word is found
-            if any(junk in link_lower for junk in junk_urls):
-                continue
-            if any(junk in title_lower for junk in junk_titles):
-                continue
-                
             if title and link:
                 out.append({
                     "date": "", 
