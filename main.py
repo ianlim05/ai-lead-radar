@@ -3,7 +3,7 @@ GBS Lead Radar
 Searches Google News + Bing News (Malaysia focus) and extra RSS feeds for companies planning a GBS / shared services / COE.
 Scores leads 1-5, uses Playwright to extract public LinkedIn company metadata securely, and saves to results.csv.
 
-Setup:  pip install requests openpyxl playwright
+Setup:  pip install requests openpyxl playwright pywin32 python-dotenv PyPDF2
         playwright install chromium
 Run:    python main.py
 Optional AI scoring (free Gemini key from aistudio.google.com/apikey):
@@ -11,37 +11,41 @@ Optional AI scoring (free Gemini key from aistudio.google.com/apikey):
         $env:GEMINI_API_KEY="your_key"   (PowerShell)
 """
 import csv
-print("Script is starting...")
 import json
 import os
-from dotenv import load_dotenv
-import urllib
-load_dotenv()  # read GEMINI_API_KEY from .env
 import re
 import time
+import urllib
+import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
-import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
+
 import requests
-from agent_reach.channels.web import WebChannel
-from agent_reach.runtime.dispatch import run_action
 import win32com.client
+from dotenv import load_dotenv
+
+print("Script is starting...")
+load_dotenv()  # read GEMINI_API_KEY from .env
+
+# ---------- SETTINGS (edit these) ----------
 
 # ---------- SETTINGS (edit these) ----------
 # Keywords come from this Excel file if it exists (sheet "Keywords": column A = Keyword, column B = Active Yes/No).
 KEYWORDS_FILE = "GBS Keywords.xlsx"
 OUTPUT_FILE = "results.csv"
+RECEIVER_EMAIL = "ianlim@agosasia.com"  # Use semicolons for multiple emails
+SENDER_EMAIL = "ianlim@agosasia.com"    # The exact Outlook account sending the email
 
 # Malaysian outlets, searched through Google News with a site: filter
 MALAYSIA_SITES = ["thestar.com.my", "theedgemalaysia.com", "nst.com.my", "malaymail.com", "bernama.com"]
 DAYS = 7
 MIN_LEAD_SCORE = 4  # Only output high-quality leads (4 or 5) to the terminal
-MAX_AI_CALLS = 100
+MAX_AI_CALLS = 200
 COMPANY_ALIASES = {"tp": "Teleperformance"}  # same company under different names in the news (lowercase key)
 OUTREACH_MIN_SCORE = 4   # only leads at this score or higher get target roles and a draft message
-MAX_DEEP_RESEARCH = 15  # max companies drafted per run (protects the free AI quota)
+MAX_DEEP_RESEARCH = 30  # max companies drafted per run (protects the free AI quota)
 YOUR_COMPANY = "Agos Asia Sdn Bhd"  # who the draft message says the sender works for
 USE_BING = True  # Bing News RSS as a second search source (adds results Google News does not show)
 
@@ -182,15 +186,15 @@ def fetch_tinyfish(query):
         # Forces TinyFish to look for actual announcements and avoid general chatter
         advanced_query = f'{query} AND ("press release" OR announces OR launches OR expansion OR "new office")'
         
-        # 1-month date filter to balance freshness and API quota
-        thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+        # Filter strictly to the weekly run cycle to prevent re-processing old junk
+        recent_date = (datetime.now(timezone.utc) - timedelta(days=DAYS)).strftime("%Y-%m-%d")
         
         r = requests.get(
             "https://api.search.tinyfish.ai", 
             headers={"X-API-Key": api_key},
             params={
                 "query": advanced_query,
-                "after_date": thirty_days_ago
+                "after_date": recent_date  # Use the new 7-day variable here
             },
             timeout=30
         )
@@ -301,8 +305,9 @@ def score_all(items):
             company_name = clean_company(j.get("company"))
             if not company_name or company_name.lower() in ["", "none", "n/a", "not stated", "unknown"]:
                 print(f"   Skipping: Gemini found no company for {i['link']}")
+                i["trash"] = True  # NEW: Explicitly mark the junk article for deletion
                 fails = 0
-                continue  # Throws the article in the trash, does NOT save it to the CSV!
+                continue  # Skips the rest of the loop
                 
             # If it survives the assassin, it gets saved normally
             i.update({
@@ -326,7 +331,10 @@ def score_all(items):
                 print("   3 failures in a row. Stopping AI scoring, please run again in a few minutes.")
                 break
         ai_calls += 1
-        time.sleep(5)
+        time.sleep(8)
+
+    # NEW: Actually remove the trashed items from the list so they never reach the CSV
+    items[:] = [i for i in items if not i.get("trash")]
 
 def rule_score(title):
     """Safety net fallback score. 0 indicates Gemini never scored the article."""
@@ -401,26 +409,15 @@ def add_outreach(items):
             # 1. Use the new Bing lookup to resolve Google News redirects to real publisher URLs
             url = find_publisher_link(i["title"], i.get("company", "")) if "news.google.com" in i["link"] else i["link"]
             
-            # 2. Try the primary Agent-Reach stealth reader
+            # 2. Read the article using the unified Playwright browser
             article_text = fetch_article_text(url or i["link"])
-            
-            # 3. If it failed to get sufficient text, fallback to the standard Playwright browser reader
-            if len(article_text) < 500:
-                try:
-                    final_url, article_text = fetch_article_text_playwright(url or i["link"])
-                    print(f"    browser reader: {len(article_text)} chars from {final_url[:80]}")
-                except Exception as e:
-                    print(f"    browser reader error: {type(e).__name__}")
-                    article_text = ""
-            
-            article_text = article_text[:8000]
             
             i["article_status"] = f"full text ({len(article_text)} chars)" if len(article_text) > 500 else "headline only"
             print(f"    article: {i['article_status']}")
             
             # Get the JSON dictionary from Gemini
             j_raw = generate_executive_brief(i, article_text)
-            print("    [DEBUG] AI Output:", j_raw)  
+            print("    AI Output:", j_raw)  
             
             # Safely extract the strings
             i["trigger_event"] = str(j_raw.get("trigger_event", ""))
@@ -449,7 +446,7 @@ def add_outreach(items):
             if fails >= 3:
                 print("   3 failures in a row. Stopping, please run again in a few minutes.")
                 break
-        time.sleep(5)
+        time.sleep(8)
 
 def find_publisher_link(title, company=""):
     """Google News links cannot be read. Find the same story on Bing to get the real article address."""
@@ -477,39 +474,41 @@ def find_publisher_link(title, company=""):
     return ""
 
 def fetch_article_text(url):
-    text = ""
-    print(f"    reading: {url}")
-    try:
-        out = run_action(WebChannel(), "read", {"target": url}, timeout=25.0)
-        if out.get("ok") and out.get("items"):
-            text = str(out["items"][0].get("text", ""))
-        else:
-            print("    Agent-Reach could not read it, handing off to browser...")
-    except Exception as e:
-        print(f"    Agent-Reach error: {e}")
-        
-    return text[:8000]
-
-def fetch_article_text_playwright(url):
-    """Open a page in a normal headless browser. Follows Google News redirects. Returns (final_url, text)."""
-    from playwright.sync_api import sync_playwright
-    final_url, text = url, ""
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+    """Open a page in a headless browser, or extract text if it is a PDF."""
+    url_lower = url.lower()
+    if ".pdf" in url_lower:
+        import io
+        from PyPDF2 import PdfReader
+        print(f"    reading PDF: {url}")
         try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            reader = PdfReader(io.BytesIO(r.content))
+            text = " ".join([page.extract_text() for page in reader.pages[:10] if page.extract_text()])
+            return text[:8000]
+        except Exception as e:
+            print(f"    PDF reader error: {type(e).__name__}")
+            return ""
+
+    # If it's a normal website, use Playwright
+    from playwright.sync_api import sync_playwright
+    print(f"    reading: {url}")
+    text = ""
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             page.goto(url, timeout=30000, wait_until="domcontentloaded")
-            try:  # a Google News link redirects to the publisher; wait until we leave news.google.com
+            try:  
                 page.wait_for_url(lambda u: "news.google.com" not in u, timeout=10000)
             except Exception:
                 pass
             page.wait_for_timeout(1500)
-            final_url = page.url
             el = page.query_selector("article") or page.query_selector("main") or page.query_selector("body")
             text = " ".join((el.inner_text() if el else "").split())
-        finally:
             browser.close()
-    return final_url, text
+    except Exception as e:
+        print(f"    browser reader error: {type(e).__name__}")
+    return text[:8000]
 
 def generate_executive_brief(i, article_text):
     note = ""
@@ -591,6 +590,16 @@ def send_sales_email(leads):
     html = f"<h2 style='font-family: Arial;'>New GBS Leads Found: {datetime.now():%Y-%m-%d}</h2>"
     for i in leads[:20]:
         company = i.get('company') or 'Unknown Company'
+        
+        # Build buttons dynamically
+        buttons_html = f'<a href="{i["link"]}" style="background-color: #0073b1; color: white; padding: 5px 10px; text-decoration: none; border-radius: 3px; margin-right: 10px;">Read Article</a>'
+        
+        if i.get('linkedin_company_search'):
+            buttons_html += f'\n                <a href="{i["linkedin_company_search"]}" style="background-color: #0073b1; color: white; padding: 5px 10px; text-decoration: none; border-radius: 3px; margin-right: 10px;">Company LinkedIn</a>'
+            
+        if i.get('linkedin_people_search'):
+            buttons_html += f'\n                <a href="{i["linkedin_people_search"]}" style="background-color: #0073b1; color: white; padding: 5px 10px; text-decoration: none; border-radius: 3px;">People Search</a>'
+
         html += f"""
         <div style="font-family: Arial; margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px; background-color: #f9f9f9;">
             <h3 style="margin-top: 0; color: #2c3e50;">[{i['score']}] {company} | {i['location']}</h3>
@@ -599,9 +608,7 @@ def send_sales_email(leads):
             <p><strong>Key Players:</strong> {i.get('key_players', '')}</p>
             <p><strong>Angle:</strong> {i.get('angle', '')}</p>
             <p style="margin-top: 15px;">
-                <a href="{i['link']}" style="background-color: #0073b1; color: white; padding: 5px 10px; text-decoration: none; border-radius: 3px; margin-right: 10px;">Read Article</a>
-                <a href="{i.get('linkedin_company_search', '')}" style="background-color: #0073b1; color: white; padding: 5px 10px; text-decoration: none; border-radius: 3px; margin-right: 10px;">Company LinkedIn</a>
-                <a href="{i.get('linkedin_people_search', '')}" style="background-color: #0073b1; color: white; padding: 5px 10px; text-decoration: none; border-radius: 3px;">People Search</a>
+                {buttons_html}
             </p>
         </div>
         """
@@ -611,11 +618,16 @@ def send_sales_email(leads):
         outlook = win32com.client.Dispatch('outlook.application')
         mail = outlook.CreateItem(0)  # 0 represents a standard Mail Item
         
-        mail.To = "ianlim@agosasia.com"  # Separate multiple emails with a semicolon (;) for Outlook
+        mail.To = RECEIVER_EMAIL
         mail.Subject = f"🚀 GBS Lead Radar: {len(leads)} New Qualified Leads"
         mail.HTMLBody = html
         
-        # mail.Display()  # Optional: Un-comment this line if you want to preview the email before it sends
+        # --- The bulletproof way to force the sender account ---
+        for account in outlook.Session.Accounts:
+            if SENDER_EMAIL.lower() in account.DisplayName.lower() or SENDER_EMAIL.lower() == account.SmtpAddress.lower():
+                mail.SendUsingAccount = account
+                break
+        
         mail.Send()
         print("   Email successfully sent to the sales team via local Outlook!")
         
@@ -669,7 +681,7 @@ def main():
         w.writeheader()
         w.writerows(rows)
 
-    leads = [i for i in items if i["score"] >= MIN_LEAD_SCORE]
+    leads = [i for i in items if str(i.get("score")) != "Not Scored" and int(float(i["score"])) >= MIN_LEAD_SCORE]
     seen, unique = {}, []
     for i in leads:  # one entry per company, best score first
         key = norm(i["company"]) or norm(i["title"])
