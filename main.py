@@ -68,7 +68,8 @@ JUNK_URLS = [
 JUNK_TITLES = [
     "what is", "meaning", "explained", "vs ", "vs.", "guide", "hiring", "apply now", 
     "report", "survey", "forecast", "results", "quarter", "earnings", "prospectus", 
-    "appoints", "appointed", "names", "former", "steps down"
+    "appoints", "appointed", "names", "former", "steps down", 
+    "data centre", "data center", "cloud region", "infrastructure"
 ]
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
@@ -131,6 +132,7 @@ def load_excel_config():
         return []
 
 def collect():
+    """The master collection manager. Triggers all search engines and runs the Universal Bouncer to scrub spam."""
     items = []
     keywords = load_excel_config()
     print("Collecting news...")
@@ -189,7 +191,7 @@ def fetch_bing(query):
     return out
 
 def fetch_tinyfish(query):
-    """Hunts for corporate blogs and PDFs using TinyFish with strict noise filters."""
+    """The targeted corporate hunter. Attaches strict action filters to keywords to pull high-value announcements."""
     api_key = os.getenv("TINYFISH_API_KEY")
     if not api_key:
         return [] 
@@ -291,10 +293,11 @@ def score_all(items):
     for i in items:
         i.update({"company": "", "signal": "", "location": "", "score": rule_score(i["title"])})
     if not GEMINI_KEY:
-        print("No GEMINI_API_KEY set: using simple rule-based scoring (company names stay blank).")
+        print("No GEMINI_API_KEY set: skipping AI scoring (items will remain 'Not Scored').")
         return
     print("Scoring with Gemini...")
-    # Highest rule-based scores first; the cap protects the free quota
+    
+    # The cap protects the free quota
     for i in sorted(items, key=lambda x: -x["score"]):
         if ai_calls >= MAX_AI_CALLS:
             break
@@ -305,7 +308,7 @@ def score_all(items):
             company_name = clean_company(j.get("company"))
             if not company_name or company_name.lower() in ["", "none", "n/a", "not stated", "unknown"]:
                 print(f"   Skipping: Gemini found no company for {i['link']}")
-                i["trash"] = True  # NEW: Explicitly mark the junk article for deletion
+                i["trash"] = True  # Explicitly mark the junk article for deletion
                 fails = 0
                 continue  # Skips the rest of the loop
                 
@@ -318,7 +321,7 @@ def score_all(items):
             })
             fails = 0
         except RuntimeError:
-            print("   Gemini rate limit hit, stopping AI scoring. Rule-based scores kept for the rest.")
+            print("   Gemini rate limit hit, stopping AI scoring. Remaining items left as Not Scored.")
             break
         except PermissionError as e:
             print("   ", e)
@@ -326,14 +329,14 @@ def score_all(items):
             break
         except Exception as e:
             fails += 1
-            print("   AI error on one item, kept rule-based score:", e)
+            print("   AI error on one item, left as Not Scored:", e)
             if fails >= 3:
                 print("   3 failures in a row. Stopping AI scoring, please run again in a few minutes.")
                 break
         ai_calls += 1
         time.sleep(8)
 
-    # NEW: Actually remove the trashed items from the list so they never reach the CSV
+    # Actually remove the trashed items from the list so they never reach the CSV
     items[:] = [i for i in items if not i.get("trash")]
 
 def rule_score(title):
@@ -350,7 +353,8 @@ def ai_score(title):
         'centre; 2 = a vendor or outsourcing deal, or a relevant company only mentioned in passing; 1 = executive '
         'appointments, reports, surveys, commentary, government news or anything unrelated. '
         'A "Centre of Excellence" counts only if it is an internal shared-services or operations centre; '
-        "a technology vendor's own AI or innovation lab for customers scores 2.}. "
+        "a technology vendor's own AI or innovation lab for customers scores 2. "
+        "CRITICAL: Data centres, cloud server regions, general corporate headquarters (HQs), and general industry overviews MUST score 1.} "
         "Headline: " + title
     )
     return gemini_json(prompt)
@@ -400,7 +404,7 @@ def add_outreach(items):
             todo.append(i)
             
     todo = todo[:MAX_DEEP_RESEARCH]
-    print(f"\nResearching {len(todo)} companies (reading articles and building cheat sheets)...")
+    print(f"\nResearching {len(todo)} companies...")
     fails = 0
     for i in todo:
         try:
@@ -566,14 +570,25 @@ def load_history():
     except Exception as e:
         print("Could not read the existing results file:", e)
         return [], False
-    # Excel can leave empty lines of commas behind after "select all + delete". Ignore rows with no title or link.
+        
+    # Excel can leave empty lines of commas behind. Ignore rows with no title or link.
     rows = [r for r in rows if (r.get("title") or r.get("link") or "").strip()]
+    
+    valid_rows = []
     for r in rows:
+        # NEW: If it was never scored by the AI, forget it! 
+        # The radar will catch it again fresh on the next run and retry the AI.
+        if str(r.get("score")) == "0" or str(r.get("score")) == "Not Scored":
+            continue
+            
         try:
             r["score"] = int(float(r.get("score") or 0))
         except ValueError:
             r["score"] = 0
-    return rows, True
+            
+        valid_rows.append(r)
+        
+    return valid_rows, True
 
 def timestamped():
     base, ext = os.path.splitext(OUTPUT_FILE)
@@ -653,7 +668,7 @@ def main():
     
     score_all(items)
     
-    # 2. Call the updated outreach function
+    # 1. Call the updated outreach function
     add_outreach(items)
 
     rows = items + history  # new rows first, older rows and their notes kept as they were
@@ -694,7 +709,7 @@ def main():
         
     print(f"\nNEW LEADS THIS RUN (score >= {MIN_LEAD_SCORE}): {len(unique)} companies from {len(leads)} articles\n" + "-" * 60)
     
-    # 3. Print the new 4-Column Executive Brief to the terminal
+    # 2. Print the new 4-Column Executive Brief to the terminal
     for i in unique[:20]:
         display_score = "Not Scored" if str(i.get('score')) == "0" else i['score']
         more = f"  ({i['extra']} more article(s))" if i['extra'] else ""
