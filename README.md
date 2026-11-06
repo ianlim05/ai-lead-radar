@@ -73,5 +73,3 @@ At the very top of `main.py`, you can safely adjust the following global setting
 *   `JUNK_TITLES` & `JUNK_URLS`: Add new spam words or blocked websites here to instantly reject them.
 *   `COMPANY_ALIASES`: Auto-corrects common news abbreviations (e.g., `{"tp": "Teleperformance"}`).
 *   `MALAYSIA_SITES`: A VIP list of local news websites the radar automatically searches to ensure you never miss a localized lead.
-
-> **⚠️ API Safety Warning:** Do not alter `MAX_AI_CALLS = 200` or `MAX_DEEP_RESEARCH = 30`. These are strict safety limits designed to protect your free Google Gemini API quota from rate-limiting bans.
