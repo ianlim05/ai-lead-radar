@@ -1,4 +1,4 @@
 .env
 __pycache__/
 *.pyc
-run.bat
+results.csv
